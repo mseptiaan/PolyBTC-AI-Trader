@@ -7,10 +7,24 @@ export interface OrderBook {
   bids: Order[];
   asks: Order[];
   hash?: string;
+  imbalance?: number;
+  imbalanceSignal?: "BUY_PRESSURE" | "SELL_PRESSURE" | "NEUTRAL";
+}
+
+export interface BTCIndicators {
+  rsi: number;
+  ema9: number;
+  ema21: number;
+  emaCross: "BULLISH" | "BEARISH";
+  volumeSpike: number;
+  trend: "STRONG_UP" | "STRONG_DOWN" | "MIXED";
+  last3Candles: { open: number; high: number; low: number; close: number; direction: "UP" | "DOWN" }[];
+  currentPrice: number;
 }
 
 export interface Market {
   id: string;
+  conditionId: string;
   question: string;
   description: string;
   outcomes: string[];
@@ -24,6 +38,11 @@ export interface Market {
   category: string;
   volume: string;
   liquidity: string;
+  eventSlug: string;
+  eventTitle: string;
+  eventId: string;
+  startDate: string;
+  endDate: string;
 }
 
 export interface BTCPrice {
@@ -32,8 +51,13 @@ export interface BTCPrice {
 }
 
 export interface BTCHistory {
-  time: number;
-  price: number;
+  time: number;   // Unix seconds (for lightweight-charts)
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  price: number;  // alias for close, backward compat
+  volume: number;
 }
 
 export interface SentimentData {
@@ -46,6 +70,9 @@ export interface AIRecommendation {
   decision: "TRADE" | "NO_TRADE";
   direction: "UP" | "DOWN" | "NONE";
   confidence: number;
+  estimatedEdge: number;
+  candlePatterns: string[];
   reasoning: string;
   riskLevel: "LOW" | "MEDIUM" | "HIGH";
+  dataMode?: "FULL_DATA" | "POLYMARKET_ONLY";
 }
