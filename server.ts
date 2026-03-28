@@ -90,12 +90,12 @@ const BTC_BACKGROUND_SYNC_MS = Number(process.env.BTC_BACKGROUND_SYNC_MS || 5_00
 const POSITION_AUTOMATION_SYNC_MS = Number(process.env.POSITION_AUTOMATION_SYNC_MS || 10_000);
 
 // ── Bot configuration ────────────────────────────────────────────────────────
-const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 10_000);
-const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 68);
-const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 8);
-const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.15);
-const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 50);
-const BOT_SESSION_LOSS_LIMIT = Number(process.env.BOT_SESSION_LOSS_LIMIT || 0.10);
+const BOT_SCAN_INTERVAL_MS = Number(process.env.BOT_SCAN_INTERVAL_MS || 5_000);
+const BOT_MIN_CONFIDENCE = Number(process.env.BOT_MIN_CONFIDENCE || 52);
+const BOT_MIN_EDGE = Number(process.env.BOT_MIN_EDGE || 0.05);
+const BOT_KELLY_FRACTION = Number(process.env.BOT_KELLY_FRACTION || 0.40);
+const BOT_MAX_BET_USDC = Number(process.env.BOT_MAX_BET_USDC || 250);
+const BOT_SESSION_LOSS_LIMIT = Number(process.env.BOT_SESSION_LOSS_LIMIT || 0.30);
 
 // ── Bot runtime state ────────────────────────────────────────────────────────
 let botEnabled = process.env.BOT_AUTO_START === "true";
@@ -105,6 +105,23 @@ let botSessionStartBalance: number | null = null;
 let botSessionTradesCount = 0;
 let botLastWindowStart = 0;
 const botAnalyzedThisWindow = new Set<string>();
+
+// ── Pre-fetch cache for next window ───────────────────────────────────────────
+interface PreFetchCache {
+  windowStart: number;
+  fetchedAt: number;
+  slug: string;
+  markets: any[];
+  btcPriceData: any;
+  btcHistoryResult: any;
+  btcIndicatorsData: any;
+  sentimentData: any;
+  orderBooks: Record<string, any>;
+  marketHistory: { t: number; yes: number; no: number }[];
+  rec: any;
+}
+let preFetchCache: PreFetchCache | null = null;
+let preFetchRunning = false;
 
 interface BotLogEntry {
   timestamp: string;
@@ -122,6 +139,75 @@ interface BotLogEntry {
   error?: string;
 }
 const botLog: BotLogEntry[] = [];
+
+interface RawLogEntry {
+  ts: string;
+  level: string;
+  msg: string;
+}
+const rawLog: RawLogEntry[] = [];
+
+interface PendingResult {
+  eventSlug: string;
+  marketId: string;
+  market: string;
+  tokenId: string;
+  direction: string;
+  outcome: string;
+  entryPrice: number;
+  betAmount: number;
+  orderId: string | null;
+  windowEnd: number;
+  // Context captured at trade time — used for learning
+  confidence: number;
+  edge: number;
+  reasoning: string;
+  windowElapsedSeconds: number;
+  rsi?: number;
+  emaCross?: string;
+  signalScore?: number;
+  imbalanceSignal?: string;
+}
+const pendingResults = new Map<string, PendingResult>();
+
+// ── Adaptive learning state ───────────────────────────────────────────────────
+interface LossMemory {
+  timestamp: string;
+  market: string;
+  direction: string;
+  confidence: number;
+  edge: number;
+  entryPrice: number;
+  betAmount: number;
+  pnl: number;
+  windowElapsedSeconds: number;
+  rsi?: number;
+  emaCross?: string;
+  signalScore?: number;
+  imbalanceSignal?: string;
+  reasoning: string;
+  lesson: string;
+}
+const lossMemory: LossMemory[] = [];
+let consecutiveLosses = 0;
+let consecutiveWins   = 0;
+let adaptiveConfidenceBoost = 0; // added on top of BOT_MIN_CONFIDENCE
+
+function generateLesson(pending: PendingResult): string {
+  const rules: string[] = [];
+  const { direction, rsi, emaCross, signalScore, windowElapsedSeconds, confidence } = pending;
+
+  if (direction === "UP"   && rsi !== undefined && rsi > 65) rules.push(`RSI overbought (${rsi.toFixed(0)}) on UP — reversal risk`);
+  if (direction === "DOWN" && rsi !== undefined && rsi < 35) rules.push(`RSI oversold (${rsi.toFixed(0)}) on DOWN — reversal risk`);
+  if (direction === "UP"   && emaCross === "BEARISH")         rules.push("EMA cross was BEARISH during UP trade");
+  if (direction === "DOWN" && emaCross === "BULLISH")         rules.push("EMA cross was BULLISH during DOWN trade");
+  if (direction === "UP"   && signalScore !== undefined && signalScore < 0) rules.push(`Negative signal score (${signalScore}) on UP trade`);
+  if (direction === "DOWN" && signalScore !== undefined && signalScore > 0) rules.push(`Positive signal score (+${signalScore}) on DOWN trade`);
+  if (windowElapsedSeconds > 220)  rules.push(`Late entry at ${windowElapsedSeconds}s — limited time for move`);
+  if (confidence < 60)             rules.push(`Low confidence entry (${confidence}%) — insufficient conviction`);
+
+  return rules.length > 0 ? rules.join(" | ") : "No dominant pattern — low probability setup";
+}
 
 type CacheDocument<T> = {
   _id: string;
@@ -1410,6 +1496,322 @@ async function startServer() {
       ERR:   "✖",
     };
     console.log(`[${ts()}] [BOT:${level.padEnd(5)}] ${icons[level]} ${msg}`);
+    rawLog.unshift({ ts: ts(), level, msg });
+    if (rawLog.length > 500) rawLog.pop();
+  };
+
+  // ── Pre-fetch next window data while current window is closing ───────────
+  const prefetchNextWindow = async (nextWindowStart: number) => {
+    if (preFetchRunning) return;
+    if (preFetchCache?.windowStart === nextWindowStart) return;
+    preFetchRunning = true;
+
+    const nextSlug = `btc-updown-5m-${nextWindowStart}`;
+    botPrint("INFO", `━━━ PRE-FETCH ━━━ Preparing next window ${new Date(nextWindowStart * 1000).toLocaleTimeString()}…`);
+
+    try {
+      const parseArr = (val: any): any[] => {
+        if (Array.isArray(val)) return val;
+        if (typeof val === "string") { try { return JSON.parse(val); } catch { return []; } }
+        return [];
+      };
+
+      // Step 1: fetch next window market
+      let markets: any[] = [];
+      try {
+        const eventRes = await axios.get(`https://gamma-api.polymarket.com/events/slug/${nextSlug}`, { timeout: 8000 });
+        const event = eventRes.data;
+        markets = (event?.markets || []).map((m: any) => ({
+          ...m,
+          outcomes: parseArr(m.outcomes),
+          outcomePrices: parseArr(m.outcomePrices),
+          clobTokenIds: parseArr(m.clobTokenIds),
+          eventSlug: event.slug,
+          eventTitle: event.title,
+          eventId: event.id,
+          startDate: event.startDate,
+          endDate: event.endDate,
+        }));
+      } catch {
+        botPrint("WARN", `Pre-fetch: next window market not yet live (${nextSlug}) — will retry`);
+        preFetchRunning = false;
+        return;
+      }
+
+      if (markets.length === 0) {
+        botPrint("WARN", `Pre-fetch: no markets found for ${nextSlug} — will retry`);
+        preFetchRunning = false;
+        return;
+      }
+
+      // Step 2: BTC data + sentiment in parallel
+      const [btcPriceData, btcHistoryResult, btcIndicatorsData, sentimentData] = await Promise.all([
+        getBtcPrice(),
+        getBtcHistory(),
+        getBtcIndicators(),
+        axios.get("https://api.alternative.me/fng/", { timeout: 5000 })
+          .then((r) => r.data.data[0]).catch(() => null),
+      ]);
+      botPrint("OK", `Pre-fetch: BTC $${btcPriceData?.price ?? "?"} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"}`);
+
+      // Step 3: order books for next window tokens
+      const market = markets[0];
+      const tokenIds: string[] = market.clobTokenIds || [];
+      const orderBooks: Record<string, any> = {};
+      await Promise.all(tokenIds.map(async (tid, idx) => {
+        try {
+          const client = await getClobClient();
+          const raw: any = client
+            ? await client.getOrderBook(tid)
+            : (await axios.get(`https://clob.polymarket.com/book?token_id=${tid}`, { timeout: 6000 })).data;
+          const sumSize = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0"), 0);
+          const sumNotional = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0") * parseFloat(o.price || "0"), 0);
+          const bidSize = sumSize(raw.bids);
+          const askSize = sumSize(raw.asks);
+          const total = bidSize + askSize;
+          const imbalance = total > 0 ? parseFloat((bidSize / total).toFixed(4)) : 0.5;
+          const imbalanceSignal = imbalance > 0.60 ? "BUY_PRESSURE" : imbalance < 0.40 ? "SELL_PRESSURE" : "NEUTRAL";
+          const totalLiquidityUsdc = parseFloat((sumNotional(raw.bids) + sumNotional(raw.asks)).toFixed(2));
+          orderBooks[tid] = { ...raw, imbalance, imbalanceSignal, totalLiquidityUsdc };
+          botPrint("OK", `Pre-fetch OB [${market.outcomes?.[idx] ?? `Token${idx}`}]: bid=${raw.bids?.[0]?.price ?? "?"} ask=${raw.asks?.[0]?.price ?? "?"} liq=$${totalLiquidityUsdc}`);
+        } catch {
+          botPrint("WARN", `Pre-fetch: OB fetch failed for token ${tid.slice(0, 12)}…`);
+        }
+      }));
+
+      // Step 4: market price history
+      let marketHistory: { t: number; yes: number; no: number }[] = [];
+      const yesId = tokenIds[0];
+      if (yesId) {
+        try {
+          const [yRes, nRes] = await Promise.all([
+            axios.get("https://clob.polymarket.com/prices-history", { params: { market: yesId, interval: "1m", fidelity: 10 }, timeout: 5000 }),
+            tokenIds[1] ? axios.get("https://clob.polymarket.com/prices-history", { params: { market: tokenIds[1], interval: "1m", fidelity: 10 }, timeout: 5000 }) : Promise.resolve({ data: [] }),
+          ]);
+          const yesData: { t: number; p: number }[] = Array.isArray(yRes.data) ? yRes.data : (yRes.data?.history ?? []);
+          const noData:  { t: number; p: number }[] = Array.isArray(nRes.data)  ? nRes.data  : (nRes.data?.history  ?? []);
+          const noMap = new Map(noData.map((d) => [d.t, d.p]));
+          marketHistory = yesData.map((d) => ({ t: d.t, yes: d.p, no: noMap.get(d.t) ?? 1 - d.p }));
+        } catch { /* non-fatal */ }
+      }
+
+      // Step 5: Gemini analysis (simulate 15s into next window for context)
+      botPrint("INFO", `Pre-fetch: running Gemini analysis for next window…`);
+      const rec = await analyzeMarket(
+        market,
+        btcPriceData?.price ?? null,
+        btcHistoryResult?.history ?? [],
+        sentimentData,
+        btcIndicatorsData,
+        orderBooks,
+        marketHistory,
+        15,
+        lossMemory.slice(0, 5)
+      );
+
+      const icon = rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—";
+      botPrint(rec.decision === "TRADE" ? "OK" : "INFO",
+        `Pre-fetch: ${icon} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}% | edge=${rec.estimatedEdge}¢ | risk=${rec.riskLevel}`);
+
+      preFetchCache = {
+        windowStart: nextWindowStart,
+        fetchedAt: Math.floor(Date.now() / 1000),
+        slug: nextSlug,
+        markets,
+        btcPriceData,
+        btcHistoryResult,
+        btcIndicatorsData,
+        sentimentData,
+        orderBooks,
+        marketHistory,
+        rec,
+      };
+      botPrint("OK", `━━━ PRE-FETCH DONE ━━━ Next window ready — will fire immediately at 10s mark`);
+    } catch (err: any) {
+      botPrint("WARN", `Pre-fetch error: ${err?.message || String(err)}`);
+    } finally {
+      preFetchRunning = false;
+    }
+  };
+
+  // ── Win / Loss result checker ─────────────────────────────────────────────
+  const checkPendingResults = async () => {
+    if (pendingResults.size === 0) return;
+    const now = Math.floor(Date.now() / 1000);
+    const parseLocal = (val: any): any[] => {
+      if (Array.isArray(val)) return val;
+      if (typeof val === "string") { try { return JSON.parse(val); } catch { return []; } }
+      return [];
+    };
+
+    for (const [tokenId, pending] of pendingResults) {
+      if (now < pending.windowEnd + 120) continue; // wait 2 min after close
+      const giveUp = now > pending.windowEnd + 1200; // give up after 20 min
+
+      // ── Step 1: Check OUR specific token's current price via CLOB ─────────
+      // tokenId is exactly the token we bought (YES for UP, NO for DOWN)
+      // After resolution: worth ~$1.00 if we won, ~$0.00 if we lost
+      let ourTokenPrice: number | null = null;
+      let resolvedSource = "";
+
+      try {
+        const clobClient = await getClobClient();
+        if (clobClient) {
+          const book = await clobClient.getOrderBook(tokenId);
+          const bids: any[] = book?.bids ?? [];
+          const asks: any[] = book?.asks ?? [];
+          const bestBid = bids.length > 0 ? parseFloat(bids[0].price) : null;
+          const bestAsk = asks.length > 0 ? parseFloat(asks[0].price) : null;
+
+          botPrint("INFO", `Result check [CLOB] tokenId=${tokenId.slice(0, 10)}… bid=${bestBid ?? "none"} ask=${bestAsk ?? "none"}`);
+
+          if (bestBid !== null && bestBid >= 0.90) {
+            ourTokenPrice = bestBid;          // token worth ~$1 → WIN
+            resolvedSource = `CLOB bid=${bestBid.toFixed(3)}`;
+          } else if (bestBid !== null && bestBid <= 0.10) {
+            ourTokenPrice = bestBid;          // token worth ~$0 → LOSS
+            resolvedSource = `CLOB bid=${bestBid.toFixed(3)}`;
+          } else if (bestBid === null && bestAsk === null) {
+            // No order book at all — market likely settled, check prices-history
+            try {
+              const hist = await axios.get("https://clob.polymarket.com/prices-history", {
+                params: { market: tokenId, interval: "1m", fidelity: 1 },
+                timeout: 6000,
+              });
+              const pts: { t: number; p: number }[] = Array.isArray(hist.data)
+                ? hist.data : (hist.data?.history ?? []);
+              if (pts.length > 0) {
+                const lastPrice = pts[pts.length - 1].p;
+                botPrint("INFO", `Result check [prices-history] lastPrice=${lastPrice.toFixed(3)}`);
+                if (lastPrice >= 0.90 || lastPrice <= 0.10) {
+                  ourTokenPrice = lastPrice;
+                  resolvedSource = `prices-history last=${lastPrice.toFixed(3)}`;
+                }
+              }
+            } catch { /* non-fatal */ }
+          }
+        }
+      } catch { /* CLOB unavailable — fall through to gamma */ }
+
+      // ── Step 2: Fallback — Gamma API using correct outcome index ──────────
+      if (ourTokenPrice === null) {
+        try {
+          const eventRes = await axios.get(
+            `https://gamma-api.polymarket.com/events/slug/${pending.eventSlug}`,
+            { timeout: 8000 }
+          );
+          const markets: any[] = eventRes.data?.markets || [];
+          const mkt = markets.find((m: any) =>
+            m.id === pending.marketId ||
+            parseLocal(m.clobTokenIds).includes(tokenId)
+          );
+
+          if (mkt) {
+            // mkt.winner is the most reliable field
+            if (typeof mkt.winner === "string" && mkt.winner.length > 0) {
+              const yesWon = mkt.winner.toLowerCase().startsWith("y");
+              // Map to our token: UP bought YES (index 0), DOWN bought NO (index 1)
+              ourTokenPrice = (pending.direction === "UP" ? yesWon : !yesWon) ? 1.0 : 0.0;
+              resolvedSource = `gamma winner="${mkt.winner}"`;
+              botPrint("INFO", `Result check [gamma winner] ${mkt.winner} → ourToken=${ourTokenPrice}`);
+            } else {
+              // Use outcomePrices at OUR outcome index, not always index 0
+              const prices = parseLocal(mkt.outcomePrices);
+              const ourIndex = pending.direction === "UP" ? 0 : 1;
+              const ourPrice = parseFloat(prices[ourIndex] ?? "0.5");
+              botPrint("INFO", `Result check [gamma prices] index=${ourIndex} ourPrice=${ourPrice.toFixed(3)} resolved=${mkt.resolved}`);
+              if ((ourPrice >= 0.90 || ourPrice <= 0.10) && mkt.resolved !== false) {
+                ourTokenPrice = ourPrice;
+                resolvedSource = `gamma outcomePrices[${ourIndex}]=${ourPrice.toFixed(3)}`;
+              }
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
+
+      // ── Still can't determine — wait or give up ────────────────────────────
+      if (ourTokenPrice === null) {
+        if (giveUp) {
+          botPrint("WARN", `Result UNKNOWN after 20min for "${pending.market.slice(0, 40)}" — removing tracker`);
+          pendingResults.delete(tokenId);
+        } else {
+          const waitedMin = ((now - pending.windowEnd) / 60).toFixed(1);
+          botPrint("INFO", `Result pending (${waitedMin}min elapsed) — retrying next cycle`);
+        }
+        continue;
+      }
+
+      // ── Determine WIN / LOSS ───────────────────────────────────────────────
+      // PnL: shares × $1 payout minus cost (WIN), or full bet lost (LOSS)
+      // won_final = pnl > 0: even $0.01 profit = WIN; no profit = LOSS
+      const shares = pending.entryPrice > 0 ? pending.betAmount / pending.entryPrice : 0;
+      const grossPayout = ourTokenPrice >= 0.90 ? shares * 1.0 : shares * ourTokenPrice;
+      const pnl = parseFloat((grossPayout - pending.betAmount).toFixed(2));
+      const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+      const won_final = pnl > 0;
+
+      botPrint("INFO", `Result resolved via [${resolvedSource}] → ${won_final ? "WIN" : "LOSS"} (ourTokenPrice=${ourTokenPrice.toFixed(3)}, pnl=${pnlStr})`);
+
+      if (won_final) {
+        // ── WIN: relax adaptive threshold ──────────────────────────────────
+        consecutiveWins++;
+        consecutiveLosses = 0;
+        if (consecutiveWins >= 2 && adaptiveConfidenceBoost > 0) {
+          adaptiveConfidenceBoost = Math.max(adaptiveConfidenceBoost - 3, 0);
+          botPrint("OK", `Adaptive learning: streak=${consecutiveWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost}% (boost=${adaptiveConfidenceBoost > 0 ? `+${adaptiveConfidenceBoost}%` : "none"})`);
+        }
+        botPrint("OK", `━━━ 🏆 WIN  ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+      } else {
+        // ── LOSS: record memory, tighten adaptive threshold ────────────────
+        consecutiveLosses++;
+        consecutiveWins = 0;
+        const lesson = generateLesson(pending);
+
+        lossMemory.unshift({
+          timestamp: new Date().toISOString(),
+          market: pending.market,
+          direction: pending.direction,
+          confidence: pending.confidence,
+          edge: pending.edge,
+          entryPrice: pending.entryPrice,
+          betAmount: pending.betAmount,
+          pnl,
+          windowElapsedSeconds: pending.windowElapsedSeconds,
+          rsi: pending.rsi,
+          emaCross: pending.emaCross,
+          signalScore: pending.signalScore,
+          imbalanceSignal: pending.imbalanceSignal,
+          reasoning: pending.reasoning,
+          lesson,
+        });
+        if (lossMemory.length > 20) lossMemory.pop();
+
+        if (consecutiveLosses >= 2) {
+          adaptiveConfidenceBoost = Math.min(adaptiveConfidenceBoost + 5, 20);
+          botPrint("WARN", `Adaptive learning: streak=${consecutiveLosses}L — threshold raised to ${BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost}% (+${adaptiveConfidenceBoost}% boost)`);
+        }
+        botPrint("WARN", `━━━ ✗ LOSS ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        botPrint("INFO", `Lesson recorded: ${lesson}`);
+      }
+
+      botLog.unshift({
+        timestamp: new Date().toISOString(),
+        market: pending.market,
+        decision: won_final ? "WIN" : "LOSS",
+        direction: pending.direction,
+        confidence: 0,
+        edge: 0,
+        riskLevel: "LOW",
+        reasoning: `Market resolved ${won_final ? "IN YOUR FAVOR ✓" : "AGAINST YOU ✗"} | Direction: ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}${!won_final ? ` | Lesson: ${generateLesson(pending)}` : ""}`,
+        tradeExecuted: false,
+        tradeAmount: pending.betAmount,
+        tradePrice: pending.entryPrice,
+        orderId: pending.orderId,
+      });
+      if (botLog.length > 100) botLog.pop();
+
+      pendingResults.delete(tokenId);
+    }
   };
 
   // ── Bot cycle ──────────────────────────────────────────────────────────────
@@ -1417,6 +1819,7 @@ async function startServer() {
     if (botRunning || !botEnabled) return;
     botRunning = true;
     try {
+      await checkPendingResults();
       const nowUtcSeconds = Math.floor(Date.now() / 1000);
       const currentWindowStart = Math.floor(nowUtcSeconds / MARKET_SESSION_SECONDS) * MARKET_SESSION_SECONDS;
       const windowElapsedSeconds = nowUtcSeconds - currentWindowStart;
@@ -1431,14 +1834,40 @@ async function startServer() {
         botPrint("INFO", `━━━━ NEW WINDOW ━━━━ ${new Date(currentWindowStart * 1000).toLocaleTimeString()} — ${new Date((currentWindowStart + 300) * 1000).toLocaleTimeString()}`);
       }
 
-      // Only trade in the valid entry zone (30s–270s elapsed)
-      if (windowElapsedSeconds < 30 || windowElapsedSeconds > 270) {
-        botPrint("SKIP", `Window ${windowElapsedSeconds < 30 ? "too early (< 30s)" : "closing soon (> 270s)"} — ${mm}:${ss} remaining. Waiting.`);
+      // During closing period (>270s): kick off async pre-fetch for next window
+      if (windowElapsedSeconds > 270) {
+        const nextWindowStart = currentWindowStart + MARKET_SESSION_SECONDS;
+        if (!preFetchRunning && preFetchCache?.windowStart !== nextWindowStart) {
+          void prefetchNextWindow(nextWindowStart);
+        }
+      }
+
+      // Only trade in the valid entry zone (10s–285s elapsed) — aggressive mode
+      if (windowElapsedSeconds < 10 || windowElapsedSeconds > 285) {
+        if (windowElapsedSeconds > 285) {
+          const nextWindowStart = currentWindowStart + MARKET_SESSION_SECONDS;
+          const pfStatus = preFetchRunning
+            ? "analyzing…"
+            : preFetchCache?.windowStart === nextWindowStart
+              ? "READY ✓"
+              : "pending…";
+          botPrint("SKIP", `Window closing (${mm}:${ss} left) — next window pre-fetch: ${pfStatus}`);
+        } else {
+          botPrint("SKIP", `Window too early (${windowElapsedSeconds}s) — ${mm}:${ss} remaining. Waiting.`);
+        }
         return;
       }
 
+      // ── Check pre-fetch cache for this window ────────────────────────────
+      let cachedWindowData: PreFetchCache | null = null;
+      if (preFetchCache?.windowStart === currentWindowStart) {
+        cachedWindowData = preFetchCache;
+        preFetchCache = null;
+        botPrint("OK", `━━━ CACHE HIT ━━━ Using pre-fetched analysis from ${new Date(cachedWindowData.fetchedAt * 1000).toLocaleTimeString()} — executing immediately`);
+      }
+
       // Fetch current market
-      const slug = `btc-updown-5m-${currentWindowStart}`;
+      const slug = cachedWindowData?.slug ?? `btc-updown-5m-${currentWindowStart}`;
       const parseArr = (val: any): any[] => {
         if (Array.isArray(val)) return val;
         if (typeof val === "string") { try { return JSON.parse(val); } catch { return []; } }
@@ -1447,29 +1876,33 @@ async function startServer() {
 
       botPrint("INFO", `Scanning window ${mm}:${ss} remaining | elapsed=${windowElapsedSeconds}s | slug=${slug}`);
 
-      let markets: any[] = [];
-      try {
-        const eventRes = await axios.get(`https://gamma-api.polymarket.com/events/slug/${slug}`, { timeout: 8000 });
-        const event = eventRes.data;
-        markets = (event?.markets || []).map((m: any) => ({
-          ...m,
-          outcomes: parseArr(m.outcomes),
-          outcomePrices: parseArr(m.outcomePrices),
-          clobTokenIds: parseArr(m.clobTokenIds),
-          eventSlug: event.slug,
-          eventTitle: event.title,
-          eventId: event.id,
-          startDate: event.startDate,
-          endDate: event.endDate,
-        }));
-        if (markets.length === 0) {
-          botPrint("WARN", `No markets found for slug: ${slug}`);
+      let markets: any[] = cachedWindowData?.markets ?? [];
+      if (markets.length === 0) {
+        try {
+          const eventRes = await axios.get(`https://gamma-api.polymarket.com/events/slug/${slug}`, { timeout: 8000 });
+          const event = eventRes.data;
+          markets = (event?.markets || []).map((m: any) => ({
+            ...m,
+            outcomes: parseArr(m.outcomes),
+            outcomePrices: parseArr(m.outcomePrices),
+            clobTokenIds: parseArr(m.clobTokenIds),
+            eventSlug: event.slug,
+            eventTitle: event.title,
+            eventId: event.id,
+            startDate: event.startDate,
+            endDate: event.endDate,
+          }));
+          if (markets.length === 0) {
+            botPrint("WARN", `No markets found for slug: ${slug}`);
+            return;
+          }
+          botPrint("INFO", `Found ${markets.length} market(s) for window`);
+        } catch {
+          botPrint("ERR", `Failed to fetch market for slug: ${slug}`);
           return;
         }
-        botPrint("INFO", `Found ${markets.length} market(s) for window`);
-      } catch {
-        botPrint("ERR", `Failed to fetch market for slug: ${slug}`);
-        return;
+      } else {
+        botPrint("INFO", `Using ${markets.length} pre-fetched market(s) for window`);
       }
 
       for (const market of markets) {
@@ -1482,74 +1915,105 @@ async function startServer() {
         botPrint("INFO", `Analyzing: ${market.question?.slice(0, 60)}`);
 
         try {
-          // Fetch all data in parallel
-          botPrint("INFO", "Fetching BTC price, history, indicators, sentiment...");
-          const [btcPriceData, btcHistoryResult, btcIndicatorsData, sentimentData] = await Promise.all([
-            getBtcPrice(),
-            getBtcHistory(),
-            getBtcIndicators(),
-            axios.get("https://api.alternative.me/fng/", { timeout: 5000 })
-              .then((r) => r.data.data[0]).catch(() => null),
-          ]);
-          botPrint("OK", `BTC $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"}`);
+          // ── Use pre-fetched data if cache hit, otherwise fetch fresh ───────
+          let btcPriceData: any;
+          let btcHistoryResult: any;
+          let btcIndicatorsData: any;
+          let sentimentData: any;
+          let orderBooks: Record<string, any>;
+          let marketHistory: { t: number; yes: number; no: number }[];
 
-          // Fetch order books with computed imbalance + liquidity
-          botPrint("INFO", "Fetching order books...");
-          const tokenIds: string[] = market.clobTokenIds || [];
-          const orderBooks: Record<string, any> = {};
-          await Promise.all(tokenIds.map(async (tid, idx) => {
-            try {
-              const client = await getClobClient();
-              const raw: any = client
-                ? await client.getOrderBook(tid)
-                : (await axios.get(`https://clob.polymarket.com/book?token_id=${tid}`, { timeout: 6000 })).data;
-              const sumSize = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0"), 0);
-              const sumNotional = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0") * parseFloat(o.price || "0"), 0);
-              const bidSize = sumSize(raw.bids);
-              const askSize = sumSize(raw.asks);
-              const total = bidSize + askSize;
-              const imbalance = total > 0 ? parseFloat((bidSize / total).toFixed(4)) : 0.5;
-              const imbalanceSignal = imbalance > 0.60 ? "BUY_PRESSURE" : imbalance < 0.40 ? "SELL_PRESSURE" : "NEUTRAL";
-              const totalLiquidityUsdc = parseFloat((sumNotional(raw.bids) + sumNotional(raw.asks)).toFixed(2));
-              orderBooks[tid] = { ...raw, imbalance, imbalanceSignal, totalLiquidityUsdc };
-              const outcome = market.outcomes?.[idx] ?? `Token${idx}`;
-              botPrint("OK", `OrderBook [${outcome}]: bid=${raw.bids?.[0]?.price ?? "?"} ask=${raw.asks?.[0]?.price ?? "?"} imbalance=${(imbalance * 100).toFixed(0)}% (${imbalanceSignal}) liquidity=$${totalLiquidityUsdc}`);
-            } catch {
-              botPrint("WARN", `Failed to fetch order book for token ${tid.slice(0, 12)}...`);
-            }
-          }));
+          if (cachedWindowData) {
+            btcPriceData      = cachedWindowData.btcPriceData;
+            btcHistoryResult  = cachedWindowData.btcHistoryResult;
+            btcIndicatorsData = cachedWindowData.btcIndicatorsData;
+            sentimentData     = cachedWindowData.sentimentData;
+            orderBooks        = cachedWindowData.orderBooks;
+            marketHistory     = cachedWindowData.marketHistory;
+            botPrint("OK", `Cached: BTC $${btcPriceData?.price ?? "?"} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"}`);
+          } else {
+            // Fetch all data in parallel
+            botPrint("INFO", "Fetching BTC price, history, indicators, sentiment...");
+            [btcPriceData, btcHistoryResult, btcIndicatorsData, sentimentData] = await Promise.all([
+              getBtcPrice(),
+              getBtcHistory(),
+              getBtcIndicators(),
+              axios.get("https://api.alternative.me/fng/", { timeout: 5000 })
+                .then((r) => r.data.data[0]).catch(() => null),
+            ]);
+            botPrint("OK", `BTC $${btcPriceData?.price ?? "?"} | Candles: ${btcHistoryResult?.history?.length ?? 0} | RSI: ${btcIndicatorsData?.rsi?.toFixed(1) ?? "?"} | EMA: ${btcIndicatorsData?.emaCross ?? "?"} | Sentiment: ${sentimentData?.value_classification ?? "?"}`);
 
-          // Fetch Polymarket price history for velocity signal
-          let marketHistory: { t: number; yes: number; no: number }[] = [];
-          const yesId = tokenIds[0];
-          if (yesId) {
-            try {
-              const [yRes, nRes] = await Promise.all([
-                axios.get("https://clob.polymarket.com/prices-history", { params: { market: yesId, interval: "1m", fidelity: 10 }, timeout: 5000 }),
-                tokenIds[1] ? axios.get("https://clob.polymarket.com/prices-history", { params: { market: tokenIds[1], interval: "1m", fidelity: 10 }, timeout: 5000 }) : Promise.resolve({ data: [] }),
-              ]);
-              const yesData: { t: number; p: number }[] = Array.isArray(yRes.data) ? yRes.data : (yRes.data?.history ?? []);
-              const noData: { t: number; p: number }[] = Array.isArray(nRes.data) ? nRes.data : (nRes.data?.history ?? []);
-              const noMap = new Map(noData.map((d) => [d.t, d.p]));
-              marketHistory = yesData.map((d) => ({ t: d.t, yes: d.p, no: noMap.get(d.t) ?? 1 - d.p }));
-              const latestYes = marketHistory[marketHistory.length - 1]?.yes;
-              botPrint("OK", `Market history: ${marketHistory.length} points | Latest YES: ${latestYes !== undefined ? (latestYes * 100).toFixed(1) + "¢" : "?"}`);
-            } catch {
-              botPrint("WARN", "Market price history unavailable — velocity signal disabled");
+            // Fetch order books with computed imbalance + liquidity
+            botPrint("INFO", "Fetching order books...");
+            const tokenIds: string[] = market.clobTokenIds || [];
+            orderBooks = {};
+            await Promise.all(tokenIds.map(async (tid, idx) => {
+              try {
+                const client = await getClobClient();
+                const raw: any = client
+                  ? await client.getOrderBook(tid)
+                  : (await axios.get(`https://clob.polymarket.com/book?token_id=${tid}`, { timeout: 6000 })).data;
+                const sumSize = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0"), 0);
+                const sumNotional = (orders: any[]) => (orders || []).reduce((s: number, o: any) => s + parseFloat(o.size || "0") * parseFloat(o.price || "0"), 0);
+                const bidSize = sumSize(raw.bids);
+                const askSize = sumSize(raw.asks);
+                const total = bidSize + askSize;
+                const imbalance = total > 0 ? parseFloat((bidSize / total).toFixed(4)) : 0.5;
+                const imbalanceSignal = imbalance > 0.60 ? "BUY_PRESSURE" : imbalance < 0.40 ? "SELL_PRESSURE" : "NEUTRAL";
+                const totalLiquidityUsdc = parseFloat((sumNotional(raw.bids) + sumNotional(raw.asks)).toFixed(2));
+                orderBooks[tid] = { ...raw, imbalance, imbalanceSignal, totalLiquidityUsdc };
+                const outcome = market.outcomes?.[idx] ?? `Token${idx}`;
+                botPrint("OK", `OrderBook [${outcome}]: bid=${raw.bids?.[0]?.price ?? "?"} ask=${raw.asks?.[0]?.price ?? "?"} imbalance=${(imbalance * 100).toFixed(0)}% (${imbalanceSignal}) liquidity=$${totalLiquidityUsdc}`);
+              } catch {
+                botPrint("WARN", `Failed to fetch order book for token ${tid.slice(0, 12)}...`);
+              }
+            }));
+
+            // Fetch Polymarket price history for velocity signal
+            marketHistory = [];
+            const yesId = tokenIds[0];
+            if (yesId) {
+              try {
+                const [yRes, nRes] = await Promise.all([
+                  axios.get("https://clob.polymarket.com/prices-history", { params: { market: yesId, interval: "1m", fidelity: 10 }, timeout: 5000 }),
+                  tokenIds[1] ? axios.get("https://clob.polymarket.com/prices-history", { params: { market: tokenIds[1], interval: "1m", fidelity: 10 }, timeout: 5000 }) : Promise.resolve({ data: [] }),
+                ]);
+                const yesData: { t: number; p: number }[] = Array.isArray(yRes.data) ? yRes.data : (yRes.data?.history ?? []);
+                const noData: { t: number; p: number }[] = Array.isArray(nRes.data) ? nRes.data : (nRes.data?.history ?? []);
+                const noMap = new Map(noData.map((d) => [d.t, d.p]));
+                marketHistory = yesData.map((d) => ({ t: d.t, yes: d.p, no: noMap.get(d.t) ?? 1 - d.p }));
+                const latestYes = marketHistory[marketHistory.length - 1]?.yes;
+                botPrint("OK", `Market history: ${marketHistory.length} points | Latest YES: ${latestYes !== undefined ? (latestYes * 100).toFixed(1) + "¢" : "?"}`);
+              } catch {
+                botPrint("WARN", "Market price history unavailable — velocity signal disabled");
+              }
             }
           }
 
-          botPrint("INFO", "Calling Gemini AI for analysis...");
-          const rec = await analyzeMarket(
-            market,
-            btcPriceData?.price ?? null,
-            btcHistoryResult?.history ?? [],
-            sentimentData,
-            btcIndicatorsData,
-            orderBooks,
-            marketHistory,
-            windowElapsedSeconds
-          );
+          const effectiveMinConf = BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost;
+          if (adaptiveConfidenceBoost > 0) {
+            botPrint("INFO", `Adaptive threshold active: ${effectiveMinConf}% (+${adaptiveConfidenceBoost}% from ${consecutiveLosses} loss streak | ${lossMemory.length} patterns stored)`);
+          }
+
+          // Use pre-analyzed Gemini result if available, otherwise call fresh
+          let rec: any;
+          if (cachedWindowData?.rec) {
+            rec = cachedWindowData.rec;
+            botPrint("OK", `Cached AI: ${rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—"} ${rec.decision} ${rec.direction !== "NONE" ? rec.direction : ""} | conf=${rec.confidence}% | edge=${rec.estimatedEdge}¢ | risk=${rec.riskLevel}`);
+          } else {
+            botPrint("INFO", "Calling Gemini AI for analysis...");
+            rec = await analyzeMarket(
+              market,
+              btcPriceData?.price ?? null,
+              btcHistoryResult?.history ?? [],
+              sentimentData,
+              btcIndicatorsData,
+              orderBooks,
+              marketHistory,
+              windowElapsedSeconds,
+              lossMemory.slice(0, 5)
+            );
+          }
 
           // Log AI result
           const decisionIcon = rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—";
@@ -1561,15 +2025,15 @@ async function startServer() {
 
           const qualifies =
             rec.decision === "TRADE" &&
-            rec.confidence >= BOT_MIN_CONFIDENCE &&
+            rec.confidence >= effectiveMinConf &&
             rec.estimatedEdge >= BOT_MIN_EDGE &&
-            rec.riskLevel === "LOW";
+            rec.riskLevel !== "HIGH";
 
           if (rec.decision === "TRADE" && !qualifies) {
             const reasons: string[] = [];
-            if (rec.confidence < BOT_MIN_CONFIDENCE) reasons.push(`conf ${rec.confidence}% < ${BOT_MIN_CONFIDENCE}%`);
+            if (rec.confidence < effectiveMinConf) reasons.push(`conf ${rec.confidence}% < ${effectiveMinConf}% (adaptive)`);
             if (rec.estimatedEdge < BOT_MIN_EDGE) reasons.push(`edge ${rec.estimatedEdge}¢ < ${BOT_MIN_EDGE}¢`);
-            if (rec.riskLevel !== "LOW") reasons.push(`risk=${rec.riskLevel} (need LOW)`);
+            if (rec.riskLevel === "HIGH") reasons.push(`risk=${rec.riskLevel} (need LOW or MEDIUM)`);
             botPrint("SKIP", `Trade rejected by bot filters: ${reasons.join(" | ")}`);
           }
 
@@ -1601,13 +2065,27 @@ async function startServer() {
                 } catch { /* non-fatal */ }
               }
 
-              // Session loss guard
+              // ── Live balance check ─────────────────────────────────────────
               let currentBalance = botSessionStartBalance ?? 0;
+              let balanceFresh = false;
               try {
                 const col = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
                 currentBalance = Number(ethers.utils.formatUnits(col.balance || "0", 6));
-                botPrint("INFO", `Current balance: $${currentBalance.toFixed(2)} USDC (session start: $${botSessionStartBalance?.toFixed(2) ?? "?"})`);
-              } catch { /* use last known */ }
+                balanceFresh = true;
+              } catch {
+                botPrint("WARN", `Balance fetch failed — using last known: $${currentBalance.toFixed(2)} USDC`);
+              }
+
+              botPrint("INFO", `Balance: $${currentBalance.toFixed(2)} USDC${balanceFresh ? " (live)" : " (cached)"} | Session start: $${botSessionStartBalance?.toFixed(2) ?? "?"}`);
+
+              // Hard stop if wallet is empty
+              if (currentBalance < 1) {
+                botPrint("WARN", `Insufficient balance ($${currentBalance.toFixed(2)} USDC < $1 minimum). Skipping all trades this cycle.`);
+                logEntry.reasoning += ` | Skipped: Insufficient balance ($${currentBalance.toFixed(2)}).`;
+                botLog.unshift(logEntry);
+                if (botLog.length > 100) botLog.pop();
+                break;
+              }
 
               const sessionLossPct = botSessionStartBalance && botSessionStartBalance > 0
                 ? (botSessionStartBalance - currentBalance) / botSessionStartBalance
@@ -1622,7 +2100,7 @@ async function startServer() {
                 break;
               }
 
-              // Compute Kelly bet capped at 3% bankroll and BOT_MAX_BET_USDC
+              // ── Kelly sizing with balance-aware adjustment ──────────────────
               const outcomeIndex = rec.direction === "UP" ? 0 : 1;
               const tokenId: string = market.clobTokenIds?.[outcomeIndex];
               if (tokenId) {
@@ -1631,12 +2109,23 @@ async function startServer() {
                 const b = (1 - impliedPrice) / impliedPrice;
                 const kelly = (p * b - (1 - p)) / b;
                 const rawBet = kelly > 0 ? currentBalance * kelly * BOT_KELLY_FRACTION : 0;
-                const betAmount = parseFloat(Math.min(rawBet, BOT_MAX_BET_USDC, currentBalance * 0.03).toFixed(2));
-                botPrint("INFO", `Kelly calc: raw=$${rawBet.toFixed(2)} → capped=$${betAmount.toFixed(2)} (max_bet=$${BOT_MAX_BET_USDC}, 3%_bankroll=$${(currentBalance * 0.03).toFixed(2)})`);
+
+                // Cap to Kelly formula, max bet config, and 25% of live balance (aggressive)
+                const kellyCapped = Math.min(rawBet, BOT_MAX_BET_USDC, currentBalance * 0.25);
+
+                // Reserve $1 minimum buffer — never spend the last dollar
+                const BALANCE_RESERVE = 1.0;
+                const spendable = Math.max(0, currentBalance - BALANCE_RESERVE);
+
+                // Final bet: clamped to what we can actually afford
+                const betAmount = parseFloat(Math.min(kellyCapped, spendable).toFixed(2));
+
+                botPrint("INFO", `Kelly calc: raw=$${rawBet.toFixed(2)} → capped=$${kellyCapped.toFixed(2)} (25% bal cap=$${(currentBalance * 0.25).toFixed(2)}) → spendable=$${spendable.toFixed(2)} → final=$${betAmount.toFixed(2)} USDC`);
+                botPrint("INFO", `Balance check: $${currentBalance.toFixed(2)} available | $${betAmount.toFixed(2)} to spend | $${(currentBalance - betAmount).toFixed(2)} remaining after trade`);
 
                 if (betAmount < 1) {
-                  botPrint("SKIP", `Bet too small ($${betAmount.toFixed(2)} < $1 minimum). Skipping trade.`);
-                  logEntry.reasoning += ` | Skipped: Kelly bet too small ($${betAmount.toFixed(2)}).`;
+                  botPrint("SKIP", `Adjusted bet too small ($${betAmount.toFixed(2)} USDC). Balance may be too low or Kelly fraction too conservative. Skipping.`);
+                  logEntry.reasoning += ` | Skipped: Adjusted bet $${betAmount.toFixed(2)} < $1 minimum (balance=$${currentBalance.toFixed(2)}).`;
                 } else {
                   const ob = orderBooks[tokenId];
                   const bestAsk = Number(ob?.asks?.[0]?.price || impliedPrice.toString());
@@ -1678,6 +2167,30 @@ async function startServer() {
                     botPrint("OK", `Order submitted! ID: ${tradeResult.orderID} | Status: ${tradeResult.status}`);
                     botPrint("OK", `TP: ${(parseFloat(levels.takeProfit) * 100).toFixed(0)}¢ | SL: ${(parseFloat(levels.stopLoss) * 100).toFixed(0)}¢ | TS: ${(parseFloat(levels.trailingStop) * 100).toFixed(0)}¢ distance — automation ARMED`);
                     botPrint("OK", `Session trades: ${botSessionTradesCount} | Balance: ~$${currentBalance.toFixed(2)}`);
+
+                    // Track this trade for win/loss resolution after window closes
+                    pendingResults.set(tokenId, {
+                      eventSlug: slug,
+                      marketId: market.id,
+                      market: market.question || market.id,
+                      tokenId,
+                      direction: rec.direction,
+                      outcome: market.outcomes?.[outcomeIndex] || rec.direction,
+                      entryPrice: bestAsk,
+                      betAmount,
+                      orderId: tradeResult.orderID,
+                      windowEnd: currentWindowStart + MARKET_SESSION_SECONDS,
+                      // Context for adaptive learning
+                      confidence: rec.confidence,
+                      edge: rec.estimatedEdge,
+                      reasoning: rec.reasoning,
+                      windowElapsedSeconds,
+                      rsi: btcIndicatorsData?.rsi,
+                      emaCross: btcIndicatorsData?.emaCross,
+                      signalScore: btcIndicatorsData?.signalScore,
+                      imbalanceSignal: orderBooks[tokenId]?.imbalanceSignal,
+                    });
+                    botPrint("INFO", `Result tracker armed — checking after ${new Date((currentWindowStart + MARKET_SESSION_SECONDS + 90) * 1000).toLocaleTimeString()}`);
                   } catch (tradeErr: any) {
                     logEntry.error = tradeErr?.message || String(tradeErr);
                     botPrint("ERR", `Trade execution failed: ${logEntry.error}`);
@@ -1771,6 +2284,22 @@ async function startServer() {
 
   app.get("/api/bot/log", (_req, res) => {
     res.json({ log: botLog });
+  });
+
+  app.get("/api/bot/rawlog", (_req, res) => {
+    res.json({ log: rawLog });
+  });
+
+  app.get("/api/bot/learning", (_req, res) => {
+    res.json({
+      consecutiveLosses,
+      consecutiveWins,
+      adaptiveConfidenceBoost,
+      effectiveMinConfidence: BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost,
+      baseMinConfidence: BOT_MIN_CONFIDENCE,
+      lossMemoryCount: lossMemory.length,
+      recentLosses: lossMemory.slice(0, 10),
+    });
   });
 
   // API Proxy for Polymarket — BTC Up/Down 5-Minute Events (5 timeframes)

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Bot,
@@ -15,7 +15,18 @@ import {
   RefreshCw,
   BarChart3,
   Zap,
+  LineChart as LineChartIcon,
 } from "lucide-react";
+import {
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceLine,
+  CartesianGrid,
+} from "recharts";
 
 function cn(...inputs: any[]) {
   return inputs.filter(Boolean).join(" ");
@@ -162,6 +173,35 @@ export default function BotDashboard() {
 
   const armedCount = automations.filter((a) => a.armed).length;
 
+  // Build cumulative PnL series from WIN/LOSS log entries
+  const pnlHistory = useMemo(() => {
+    const results = [...log]
+      .filter((e) => e.decision === "WIN" || e.decision === "LOSS")
+      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    let cumulative = 0;
+    return results.map((entry, i) => {
+      // Compute PnL directly from entry data — avoids string parsing bugs
+      const betAmount  = entry.tradeAmount  ?? 0;
+      const entryPrice = entry.tradePrice   ?? 0.5;
+      // WIN: bought (betAmount / entryPrice) shares, each pays $1 → net = payout - cost
+      // LOSS: shares settle at $0 → net = -betAmount
+      const tradePnl = entry.decision === "WIN"
+        ? parseFloat(((betAmount / entryPrice) - betAmount).toFixed(2))
+        : parseFloat((-betAmount).toFixed(2));
+      cumulative = parseFloat((cumulative + tradePnl).toFixed(2));
+      return {
+        label: `#${i + 1}`,
+        time: new Date(entry.timestamp).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }),
+        trade: tradePnl,
+        cumulative,
+        decision: entry.decision,
+      };
+    });
+  }, [log]);
+
+  const lastCumulative = pnlHistory.length > 0 ? pnlHistory[pnlHistory.length - 1].cumulative : 0;
+
   return (
     <div className="space-y-6">
       {/* ── Header Row ── */}
@@ -272,6 +312,105 @@ export default function BotDashboard() {
           </div>
           <div className="text-[10px] text-zinc-600">{armedCount} automations armed</div>
         </div>
+      </div>
+
+      {/* ── Session PnL Chart ── */}
+      <div className="glass-card p-4 w-full">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+            <LineChartIcon className="w-4 h-4" />
+            Session PnL
+            <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
+              {pnlHistory.length} resolved trade{pnlHistory.length !== 1 ? "s" : ""}
+            </span>
+          </h3>
+          {pnlHistory.length > 0 && (
+            <span className={cn(
+              "text-sm font-mono font-bold",
+              lastCumulative > 0 ? "text-green-400" : lastCumulative < 0 ? "text-red-400" : "text-zinc-400"
+            )}>
+              {lastCumulative > 0 ? "+" : ""}{lastCumulative.toFixed(2)} USDC
+            </span>
+          )}
+        </div>
+
+        {pnlHistory.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-28 gap-2 text-zinc-700">
+            <BarChart3 className="w-8 h-8 opacity-30" />
+            <p className="text-xs">No resolved trades yet — chart appears after first WIN or LOSS</p>
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height={180}>
+            <AreaChart data={pnlHistory} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+              <defs>
+                <linearGradient id="pnlGradientUp" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor="#22c55e" stopOpacity={0.25} />
+                  <stop offset="95%" stopColor="#22c55e" stopOpacity={0.03} />
+                </linearGradient>
+                <linearGradient id="pnlGradientDown" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%"  stopColor="#ef4444" stopOpacity={0.03} />
+                  <stop offset="95%" stopColor="#ef4444" stopOpacity={0.25} />
+                </linearGradient>
+              </defs>
+
+              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" vertical={false} />
+              <ReferenceLine y={0} stroke="#52525b" strokeDasharray="4 4" strokeWidth={1} />
+
+              <XAxis
+                dataKey="time"
+                tick={{ fill: "#52525b", fontSize: 9, fontFamily: "monospace" }}
+                axisLine={false}
+                tickLine={false}
+                interval="preserveStartEnd"
+              />
+              <YAxis
+                tick={{ fill: "#52525b", fontSize: 9, fontFamily: "monospace" }}
+                axisLine={false}
+                tickLine={false}
+                tickFormatter={(v) => `$${v}`}
+                width={40}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: "#18181b",
+                  border: "1px solid #3f3f46",
+                  borderRadius: 8,
+                  fontSize: 11,
+                  color: "#e4e4e7",
+                }}
+                labelStyle={{ color: "#71717a", marginBottom: 4 }}
+                formatter={(value: any, name: string) => [
+                  `${Number(value) >= 0 ? "+" : ""}$${Number(value).toFixed(2)}`,
+                  name === "cumulative" ? "Cumulative PnL" : "This Trade",
+                ]}
+              />
+
+              <Area
+                type="monotone"
+                dataKey="cumulative"
+                stroke={lastCumulative >= 0 ? "#22c55e" : "#ef4444"}
+                strokeWidth={2}
+                fill={lastCumulative >= 0 ? "url(#pnlGradientUp)" : "url(#pnlGradientDown)"}
+                dot={(props: any) => {
+                  const { cx, cy, payload } = props;
+                  const isWin = payload.decision === "WIN";
+                  return (
+                    <circle
+                      key={`dot-${cx}-${cy}`}
+                      cx={cx}
+                      cy={cy}
+                      r={4.5}
+                      fill={isWin ? "#22c55e" : "#ef4444"}
+                      stroke="#09090b"
+                      strokeWidth={1.5}
+                    />
+                  );
+                }}
+                activeDot={{ r: 6, stroke: "#09090b", strokeWidth: 2 }}
+              />
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
       </div>
 
       {/* ── Win / Loss / PnL Row ── */}

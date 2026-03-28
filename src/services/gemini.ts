@@ -68,7 +68,7 @@ function computeMultiTimeframeAlignment(
   }
 
   const aligned =
-    bullish >= 3 ? "UP" : bearish >= 3 ? "DOWN" : "MIXED";
+    bullish >= 2 ? "UP" : bearish >= 2 ? "DOWN" : "MIXED";
 
   return { bullish, bearish, aligned };
 }
@@ -204,6 +204,18 @@ function detectPatterns(candles: Candle[]): string[] {
   return patterns.length > 0 ? patterns : ["No clear pattern"];
 }
 
+interface LossPattern {
+  direction: string;
+  confidence: number;
+  entryPrice: number;
+  windowElapsedSeconds: number;
+  rsi?: number;
+  emaCross?: string;
+  signalScore?: number;
+  imbalanceSignal?: string;
+  lesson: string;
+}
+
 export async function analyzeMarket(
   market: Market,
   btcPrice: string | null,
@@ -212,7 +224,8 @@ export async function analyzeMarket(
   indicators: BTCIndicators | null,
   orderBooks: Record<string, OrderBook>,
   marketHistory: { t: number; yes: number; no: number }[] = [],
-  windowElapsedSeconds: number = 150
+  windowElapsedSeconds: number = 150,
+  lossPatterns: LossPattern[] = []
 ): Promise<AIRecommendation> {
   const sentimentSummary = sentiment
     ? `${sentiment.value_classification} (${sentiment.value}/100)`
@@ -250,8 +263,8 @@ export async function analyzeMarket(
     indicators
   );
 
-  // Hard gate: window timing — no trade in first 30s or last 30s of window
-  if (windowElapsedSeconds < 30 || windowElapsedSeconds > 270) {
+  // Hard gate: window timing — no trade in first 10s or last 15s of window (aggressive mode)
+  if (windowElapsedSeconds < 10 || windowElapsedSeconds > 285) {
     return {
       decision: "NO_TRADE",
       direction: "NONE",
@@ -259,8 +272,8 @@ export async function analyzeMarket(
       estimatedEdge: 0,
       candlePatterns: patterns,
       reasoning:
-        windowElapsedSeconds < 30
-          ? `Too early: only ${windowElapsedSeconds}s into window. Market liquidity thin — waiting for price discovery (30s+).`
+        windowElapsedSeconds < 10
+          ? `Too early: only ${windowElapsedSeconds}s into window. Waiting for minimal price discovery (10s).`
           : `Too late: ${windowElapsedSeconds}s elapsed, only ${300 - windowElapsedSeconds}s remaining. Entry risk too high.`,
       riskLevel: "HIGH",
       dataMode,
@@ -270,20 +283,20 @@ export async function analyzeMarket(
     };
   }
 
-  // Hard gate: order book liquidity — require $500+ total resting liquidity
+  // Hard gate: order book liquidity — require $150+ total resting liquidity (aggressive mode)
   const gateTokenIds = market.clobTokenIds || [];
   const totalLiquidity = gateTokenIds.reduce((sum, tid) => {
     const ob = orderBooks[tid];
     return sum + (ob?.totalLiquidityUsdc ?? 0);
   }, 0);
-  if (totalLiquidity > 0 && totalLiquidity < 500) {
+  if (totalLiquidity > 0 && totalLiquidity < 150) {
     return {
       decision: "NO_TRADE",
       direction: "NONE",
       confidence: 0,
       estimatedEdge: 0,
       candlePatterns: patterns,
-      reasoning: `Insufficient order book liquidity: $${totalLiquidity.toFixed(0)} USDC total (minimum $500). Thin book = bad fills and market maker risk.`,
+      reasoning: `Insufficient order book liquidity: $${totalLiquidity.toFixed(0)} USDC total (minimum $150). Book too thin for any fill.`,
       riskLevel: "HIGH",
       dataMode,
       reversalProbability: 50,
@@ -292,37 +305,23 @@ export async function analyzeMarket(
     };
   }
 
-  // Hard gate: order book must show directional pressure (>= 60% or <= 40% imbalance)
+  // Soft gate: order book should show some directional lean (>= 55% or <= 45% imbalance)
+  // In aggressive mode we only block truly flat 50/50 books with zero edge signal
   const hasDirectionalPressure = gateTokenIds.some((tid) => {
     const ob = orderBooks[tid];
-    return ob?.imbalanceSignal === "BUY_PRESSURE" || ob?.imbalanceSignal === "SELL_PRESSURE";
+    return ob && (ob.imbalance >= 0.55 || ob.imbalance <= 0.45);
   });
-  if (gateTokenIds.length > 0 && !hasDirectionalPressure) {
-    return {
-      decision: "NO_TRADE",
-      direction: "NONE",
-      confidence: 0,
-      estimatedEdge: 0,
-      candlePatterns: patterns,
-      reasoning: `Order book is neutral (no directional pressure ≥60%/≤40%). Market makers are balanced — no edge available.`,
-      riskLevel: "MEDIUM",
-      dataMode,
-      reversalProbability: 50,
-      oppositePressureProbability: 50,
-      reversalReasoning: "Order book neutrality gate triggered.",
-    };
-  }
+  // No hard block — neutral books are allowed; AI will factor it in
 
-  // Pre-AI gate: require at least 3 of 4 signals aligned for a TRADE to be valid
-  // If signals conflict strongly, return NO_TRADE without burning AI tokens
-  if (hasBtcHistory && alignment.aligned === "MIXED") {
+  // Pre-AI gate: require at least 2 of 4 signals aligned (aggressive mode allows thinner setups)
+  if (hasBtcHistory && alignment.bullish < 2 && alignment.bearish < 2) {
     return {
       decision: "NO_TRADE",
       direction: "NONE",
       confidence: 0,
       estimatedEdge: 0,
       candlePatterns: patterns,
-      reasoning: `Signal alignment too weak to trade. Bullish signals: ${alignment.bullish}/4, Bearish signals: ${alignment.bearish}/4. Multi-timeframe conflict detected — waiting for cleaner setup.`,
+      reasoning: `Signal alignment too weak to trade. Bullish: ${alignment.bullish}/4, Bearish: ${alignment.bearish}/4. No directional edge — skipping.`,
       riskLevel: "HIGH",
       dataMode,
       reversalProbability: 50,
@@ -389,6 +388,15 @@ TECHNICAL INDICATORS (last 60x 1m candles):
   const windowSeconds = windowElapsedSeconds % 60;
   const windowTimeLabel = `${windowMinutes}:${String(windowSeconds).padStart(2, "0")} elapsed of 5:00`;
 
+  const lossPatternBlock = lossPatterns.length > 0
+    ? `== ADAPTIVE LEARNING: RECENT LOSS PATTERNS (AVOID THESE SETUPS) ==
+${lossPatterns.map((l, i) =>
+  `[${i + 1}] Dir: ${l.direction} | Entry: ${(l.entryPrice * 100).toFixed(1)}¢ | Conf: ${l.confidence}% | Window: ${l.windowElapsedSeconds}s | RSI: ${l.rsi?.toFixed(0) ?? "?"} | EMA: ${l.emaCross ?? "?"} | Signal: ${l.signalScore !== undefined ? (l.signalScore > 0 ? `+${l.signalScore}` : l.signalScore) : "?"} | OB: ${l.imbalanceSignal ?? "?"}
+    Lesson: ${l.lesson}`
+).join("\n")}
+`
+    : "";
+
   const prompt = `You are a quantitative trader analyzing a Polymarket BTC 5-minute prediction market.
 Determine if there is a profitable edge to trade, and which direction.
 Current analysis mode: ${dataMode}.
@@ -426,28 +434,28 @@ ${obLines}
 ${marketHistoryBlock}
 YES Price Velocity (per min): ${priceVelocityLabel}
 
-== HIGH-PROBABILITY TRADE RULES ==
-1. MINIMUM ALIGNMENT: Only output TRADE if at least 3 of these 4 signals agree on the same direction:
+${lossPatternBlock}== AGGRESSIVE TRADE RULES (max trade frequency, professional scalper mode) ==
+1. MINIMUM ALIGNMENT: Output TRADE if at least 2 of these 4 signals agree on the same direction:
    - 60m bias
    - 5m confirmation
    - 1m trigger
    - Technical signal score (positive = bullish, negative = bearish)
-   The Multi-TF Alignment field already shows you this count. If aligned = MIXED, output NO_TRADE.
-2. MINIMUM CONFIDENCE: Never output TRADE with confidence < 68%. Below this threshold output NO_TRADE.
-3. MINIMUM EDGE: Edge exists only when your probability estimate differs from implied price by more than 8 cents.
-4. RISK LEVEL: Only output riskLevel = "LOW" when 4/4 signals aligned + no RSI extreme + no reversal risk. 3/4 signals = "MEDIUM". Any conflict or reversal risk > 40% = "HIGH". Only LOW risk setups should be traded.
-5. STRONG SETUPS ONLY (confidence 68%+): All 4 signals aligned + volume confirmation + order book imbalance in same direction = 75%+. 3 of 4 signals aligned, no counter-signals = 68-74%. Do NOT output TRADE for setups below 68%.
-6. MACD + EMA CROSS DOUBLE CONFIRM: If MACD histogram and EMA cross agree on direction, this counts as a strong single signal. If they conflict, treat both as neutral.
-7. RSI EXTREMES: RSI < 30 = strong bullish reversal potential; RSI > 70 = strong bearish reversal potential. These override marginal opposing signals.
-8. BOLLINGER BAND CONTEXT: Price at lower band in downtrend = mean-reversion caution. Price breaking above upper band with volume = momentum continuation signal.
-9. ORDER BOOK PRESSURE: BUY_PRESSURE + bullish technical alignment = additional confirmation. SELL_PRESSURE + bearish = same. Conflicting order book reduces confidence by 10%.
-10. POLYMARKET MOMENTUM: Use the price velocity (change per minute) as a leading indicator. Velocity > +0.04/min = strong UP confirmation. Velocity < -0.04/min = strong DOWN confirmation. Velocity near 0 = no momentum signal.
-11. Estimate reversal risk precisely:
-    - reversalProbability: probability price reverses against suggested direction in the next 3-5 minutes
-    - oppositePressureProbability: probability the opposite side aggressively takes control
-    - Both must be based on RSI extremes, BB position, volume, and signal conflicts
-    - If reversalProbability > 40%, set riskLevel = HIGH and reduce confidence by 8%
-12. WINDOW TIMING: If windowElapsedSeconds < 30, signals are unreliable (market just opened, liquidity thin) — output NO_TRADE. If windowElapsedSeconds > 270 (last 30s), output NO_TRADE (too late to enter). Optimal entry window is 60-240 seconds into the window.
+   Only output NO_TRADE if ALL 4 signals are flat/MIXED with zero directional lean.
+2. MINIMUM CONFIDENCE: Output TRADE with confidence >= 52%. Only NO_TRADE below 52%.
+3. MINIMUM EDGE: Edge exists when your probability estimate differs from implied price by more than 0.05 cents. Always output your honest edge estimate — even 0.1¢ is a valid edge worth trading.
+4. RISK LEVEL: 4/4 signals aligned = "LOW". 2-3/4 signals = "MEDIUM". Flat signals or reversal risk > 60% = "HIGH". Both LOW and MEDIUM setups should be traded.
+5. TRADE OFTEN (confidence 52%+): Any 2+ aligned signals + any order book lean = 52-65%. 3+ aligned = 65-78%. All 4 aligned + volume = 78%+. Push toward TRADE whenever there is any directional bias. Lean toward action.
+6. MACD + EMA CROSS: If either MACD histogram or EMA cross shows direction, treat as a signal. Both conflicting = neutral only.
+7. RSI EXTREMES: RSI < 35 = bullish momentum setup; RSI > 65 = bearish momentum setup. Mild extremes (35-45, 55-65) are opportunities, not blockers.
+8. BOLLINGER BAND CONTEXT: Near lower band = potential long. Near upper band = potential short. Both are valid setups — trade the bounce or the breakout based on alignment.
+9. ORDER BOOK PRESSURE: Any lean in the order book (even slight) adds to signal count. Neutral book is still acceptable if technicals align.
+10. POLYMARKET MOMENTUM: Velocity > +0.02/min = UP confirmation. Velocity < -0.02/min = DOWN confirmation. Even weak momentum is a signal.
+11. Reversal risk:
+    - reversalProbability: estimate honestly but do NOT use it to block trades unless > 60%
+    - oppositePressureProbability: same — only flag HIGH if truly extreme
+    - Only set riskLevel = HIGH if reversal probability > 60% AND signals are split 2/2 or worse
+12. WINDOW TIMING: windowElapsedSeconds < 10 = too early (output NO_TRADE). windowElapsedSeconds > 285 = too late (output NO_TRADE). ALL other times (10-285s) are valid entry zones — trade them.
+13. LOSS PATTERN LEARNING: If the ADAPTIVE LEARNING section above contains recent losses, study them. If the current setup matches a loss pattern (same direction + similar RSI/EMA/signal/window conditions), reduce your confidence by 10% and increase riskLevel by one step. Never repeat the exact same setup that already lost — look for a meaningfully different context before trading the same direction again.
 
 Respond with JSON only:
 {
