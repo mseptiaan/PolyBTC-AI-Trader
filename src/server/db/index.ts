@@ -47,6 +47,16 @@ export async function getPositionAutomationCollection() {
   return db?.collection<PositionAutomationDocument>(config.MONGODB_POSITION_AUTOMATION_COLLECTION) || null;
 }
 
+export async function getPaperPositionsCollection() {
+  const db = await getMongoDb();
+  return db?.collection<import("../../types/index.js").PaperPositionDocument>(config.MONGODB_PAPER_POSITIONS_COLLECTION) || null;
+}
+
+export async function getPaperBalanceCollection() {
+  const db = await getMongoDb();
+  return db?.collection<import("../../types/index.js").PaperBalanceDocument>(config.MONGODB_PAPER_BALANCE_COLLECTION) || null;
+}
+
 export async function ensureMongoCollections() {
   try {
     const db = await getMongoDb();
@@ -56,6 +66,7 @@ export async function ensureMongoCollections() {
     const priceSnapshots = db.collection(config.MONGODB_PRICE_SNAPSHOTS_COLLECTION);
     const candles = db.collection(config.MONGODB_CHART_COLLECTION);
     const automations = db.collection(config.MONGODB_POSITION_AUTOMATION_COLLECTION);
+    const paperPositions = db.collection(config.MONGODB_PAPER_POSITIONS_COLLECTION);
 
     await Promise.all([
       marketCache.createIndex({ fetchedAt: -1 }),
@@ -73,6 +84,8 @@ export async function ensureMongoCollections() {
       ),
       automations.createIndex({ assetId: 1 }, { unique: true }),
       automations.createIndex({ armed: 1, updatedAt: -1 }),
+      paperPositions.createIndex({ status: 1 }),
+      paperPositions.createIndex({ assetId: 1 }),
     ]);
   } catch (error: any) {
     console.warn("MongoDB index initialization failed:", error?.message || error);

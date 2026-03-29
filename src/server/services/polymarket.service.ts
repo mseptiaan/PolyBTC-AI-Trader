@@ -1,6 +1,8 @@
 import { ethers } from "ethers";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { config } from "../config/index.js";
+import { getPaperBalanceCollection, getPaperPositionsCollection } from "../db/index.js";
+import axios from "axios";
 
 let clobClient: ClobClient | null = null;
 let clobWallet: ethers.Wallet | null = null;
@@ -196,9 +198,12 @@ export async function executePolymarketTrade({
   executionMode?: "MANUAL" | "PASSIVE" | "AGGRESSIVE";
   amountMode?: "SPEND" | "SIZE";
 }) {
-  const client = await getClobClient();
-  if (!client) {
-    throw new Error("CLOB client not initialized. Check credentials.");
+  let client: ClobClient | null = null;
+  if (!config.PAPER_TRADING_ENABLED) {
+    client = await getClobClient();
+    if (!client) {
+      throw new Error("CLOB client not initialized. Check credentials.");
+    }
   }
 
   const parsedAmount = Number(amount);
@@ -208,7 +213,18 @@ export async function executePolymarketTrade({
     throw new Error("Trade amount must be greater than 0.");
   }
 
-  const orderbook = await client.getOrderBook(tokenID);
+  let orderbook: any;
+  if (client) {
+    orderbook = await client.getOrderBook(tokenID);
+  } else {
+    try {
+      const response = await axios.get(`https://clob.polymarket.com/book?token_id=${tokenID}`, { timeout: 6000 });
+      orderbook = response.data;
+    } catch (e) {
+      throw new Error("Failed to fetch orderbook for paper trading.");
+    }
+  }
+
   const bestBid = Number(orderbook?.bids?.[0]?.price || "0");
   const bestAsk = Number(orderbook?.asks?.[0]?.price || "0");
 
@@ -234,13 +250,19 @@ export async function executePolymarketTrade({
     throw new Error("Computed order size is invalid.");
   }
 
-  const [tickSize, negRisk] = await Promise.all([
-    client.getTickSize(tokenID),
-    client.getNegRisk(tokenID),
-  ]);
+  let tickSize: import("@polymarket/clob-client").TickSize = "0.01";
+  let negRisk = false;
+  if (client) {
+    const [tSize, nRisk] = await Promise.all([
+      client.getTickSize(tokenID),
+      client.getNegRisk(tokenID),
+    ]);
+    tickSize = tSize;
+    negRisk = nRisk;
+  }
 
-  if (parsedSide === Side.BUY && normalizedAmountMode === "SPEND") {
-    const allowance = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+  if (parsedSide === Side.BUY && normalizedAmountMode === "SPEND" && !config.PAPER_TRADING_ENABLED) {
+    const allowance = await client!.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
     const allowanceResponse = allowance as any;
     const allowanceValues = [
       allowanceResponse.allowance,
@@ -265,20 +287,132 @@ export async function executePolymarketTrade({
     }
   }
 
-  const order = await client.createAndPostOrder(
-    {
-      tokenID,
-      size: Number(orderSize.toFixed(6)),
-      side: parsedSide,
-      price: parsedPrice,
-    },
-    { tickSize, negRisk },
-    OrderType.GTC
-  );
+  const finalOrderSize = Number(orderSize.toFixed(6));
+  const spendingAmount = normalizedAmountMode === "SPEND" ? parsedAmount : Number((parsedAmount * parsedPrice).toFixed(6));
 
-  if (order?.success === false) {
-    const formatted = formatTradeError(order, { tokenID, amount, side, price: parsedPrice, tickSize, negRisk });
-    throw { ...formatted, message: formatted.error };
+  let order: any;
+
+  if (config.PAPER_TRADING_ENABLED) {
+    const balanceCol = await getPaperBalanceCollection();
+    const positionsCol = await getPaperPositionsCollection();
+    if (!balanceCol || !positionsCol) throw new Error("Database not configured for paper trading");
+
+    let balDoc = await balanceCol.findOne({});
+    if (!balDoc) {
+      await balanceCol.insertOne({ balance: config.PAPER_TRADING_INITIAL_BALANCE, updatedAt: new Date() });
+      balDoc = await balanceCol.findOne({});
+    }
+    const currentBalance = balDoc!.balance;
+
+    if (parsedSide === Side.BUY) {
+      if (currentBalance < spendingAmount) {
+        throw new Error(`Insufficient paper balance. Available: $${currentBalance.toFixed(2)}, Required: $${spendingAmount.toFixed(2)}`);
+      }
+
+      // Deduct balance
+      await balanceCol.updateOne(
+        { _id: balDoc!._id },
+        { $inc: { balance: -spendingAmount }, $set: { updatedAt: new Date() } }
+      );
+
+      // Save position
+      const existingPos = await positionsCol.findOne({ assetId: tokenID, status: "OPEN" });
+      if (existingPos) {
+        const newSize = existingPos.size + finalOrderSize;
+        const newCostBasis = existingPos.costBasis + spendingAmount;
+        await positionsCol.updateOne(
+          { _id: existingPos._id },
+          {
+            $set: {
+              size: newSize,
+              costBasis: newCostBasis,
+              averagePrice: newCostBasis / newSize,
+            }
+          }
+        );
+      } else {
+        await positionsCol.insertOne({
+          assetId: tokenID,
+          market: "Paper Market",
+          outcome: "Yes/No",
+          size: finalOrderSize,
+          costBasis: spendingAmount,
+          averagePrice: parsedPrice,
+          side: parsedSide,
+          status: "OPEN",
+          realizedPnl: 0,
+          createdAt: new Date(),
+        });
+      }
+    } else {
+      // SELL order
+      const existingPos = await positionsCol.findOne({ assetId: tokenID, status: "OPEN" });
+      if (!existingPos) {
+        throw new Error(`No open paper position found for asset ${tokenID} to sell.`);
+      }
+
+      if (existingPos.size < finalOrderSize - 0.0001) { // Floating point tolerance
+        throw new Error(`Insufficient paper position size. Available: ${existingPos.size.toFixed(4)}, Required: ${finalOrderSize.toFixed(4)}`);
+      }
+
+      const saleProceeds = finalOrderSize * parsedPrice;
+      const soldCostBasis = existingPos.averagePrice * finalOrderSize;
+      const realizedPnl = saleProceeds - soldCostBasis;
+
+      // Add to balance
+      await balanceCol.updateOne(
+        { _id: balDoc!._id },
+        { $inc: { balance: saleProceeds }, $set: { updatedAt: new Date() } }
+      );
+
+      const remainingSize = existingPos.size - finalOrderSize;
+      if (remainingSize <= 0.0001) {
+        await positionsCol.updateOne(
+          { _id: existingPos._id },
+          {
+            $set: {
+              status: "CLOSED",
+              size: 0,
+              closedAt: new Date(),
+            },
+            $inc: { realizedPnl: realizedPnl }
+          }
+        );
+      } else {
+        await positionsCol.updateOne(
+          { _id: existingPos._id },
+          {
+            $set: {
+              size: remainingSize,
+              costBasis: existingPos.costBasis - soldCostBasis,
+            },
+            $inc: { realizedPnl: realizedPnl }
+          }
+        );
+      }
+    }
+
+    order = {
+      success: true,
+      orderID: `paper-order-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      status: "MATCHED" // Assume instant fill for paper trading
+    };
+  } else {
+    order = await client!.createAndPostOrder(
+      {
+        tokenID,
+        size: finalOrderSize,
+        side: parsedSide,
+        price: parsedPrice,
+      },
+      { tickSize, negRisk },
+      OrderType.GTC
+    );
+
+    if (order?.success === false) {
+      const formatted = formatTradeError(order, { tokenID, amount, side, price: parsedPrice, tickSize, negRisk });
+      throw { ...formatted, message: formatted.error };
+    }
   }
 
   const distanceToMarket =

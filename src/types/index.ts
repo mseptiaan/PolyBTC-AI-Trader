@@ -290,6 +290,26 @@ export type PositionAutomationDocument = {
   lastTriggeredAt?: Date | null;
 };
 
+export type PaperPositionDocument = {
+  assetId: string;
+  market: string;
+  outcome: string;
+  size: number;
+  costBasis: number;
+  averagePrice: number;
+  side: string;
+  status: "OPEN" | "CLOSED";
+  realizedPnl: number;
+  createdAt: Date;
+  closedAt?: Date;
+  eventSlug?: string;
+};
+
+export type PaperBalanceDocument = {
+  balance: number;
+  updatedAt: Date;
+};
+
 // ── UI / Dashboard specific types ──────────────────────────────────────────
 
 export type BalanceState = {

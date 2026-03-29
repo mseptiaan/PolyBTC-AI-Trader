@@ -8,6 +8,7 @@ import { ensureMongoCollections } from "./db/index.js";
 import { startBtcBackgroundSync } from "./services/btc.service.js";
 import { startDivergenceTracker } from "./services/divergence.service.js";
 import { initLearningState, botEnabled } from "./services/bot.service.js";
+import { startPaperResolutionJob } from "./services/paper-resolution.service.js";
 
 import btcRouter from "./routes/btc.router.js";
 import botRouter from "./routes/bot.router.js";
@@ -26,6 +27,7 @@ async function startServer() {
   void ensureMongoCollections();
   startBtcBackgroundSync();
   startDivergenceTracker();
+  startPaperResolutionJob();
   // Start the bot loop if enabled
   if (botEnabled) {
     // startBot(); // Would be exported from bot.service.ts
