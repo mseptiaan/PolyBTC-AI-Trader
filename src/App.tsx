@@ -1,6 +1,6 @@
 import { useState, useCallback } from "react";
 import { Market, AIRecommendation } from "./types/index.js";
-import { analyzeMarket } from "./services/gemini.js";
+import { analyzeMarket } from "./services/ai.js";
 import { useMarketData } from "./hooks/useMarketData.js";
 import { useWindowCountdown } from "./hooks/useWindowCountdown.js";
 import { usePolymarketOrder } from "./hooks/usePolymarketOrder.js";

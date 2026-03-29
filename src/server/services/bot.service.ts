@@ -5,7 +5,7 @@ import { getBtcPrice, getBtcHistory, getBtcIndicators } from "./btc.service.js";
 import { getClobClient, executePolymarketTrade } from "./polymarket.service.js";
 import { divergenceState, setCurrentWindowTokens } from "./divergence.service.js";
 import { savePositionAutomation, getPositionAutomationCollection } from "./automation.service.js"; // Assume this exists
-import { analyzeMarket } from "../../services/gemini.js"; // Wrapper for gemini.ts
+import { analyzeMarket } from "../../services/ai.js"; // Wrapper for ai.ts
 import { saveTradeLog, loadTradeLog, saveLearning, loadLearning, pushSSE } from "../utils/index.js";
 import { AssetType, Side } from "@polymarket/clob-client";
 
