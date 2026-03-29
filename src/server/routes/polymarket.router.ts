@@ -5,6 +5,7 @@ import { AssetType, Side } from "@polymarket/clob-client";
 import { config } from "../config/index.js";
 import { getClobClient, getClobWallet, formatTradeError, executePolymarketTrade } from "../services/polymarket.service.js";
 import { getPositionAutomationCollection, savePositionAutomation, recommendAutomationLevels } from "../services/automation.service.js";
+import { getPaperBalanceCollection, getPaperPositionsCollection } from "../db/index.js";
 
 const router = express.Router();
 
@@ -210,6 +211,33 @@ router.post("/api/polymarket/automation/recommend", (req, res) => {
 // Balance
 router.get("/api/polymarket/balance", async (req, res) => {
   try {
+    if (config.PAPER_TRADING_ENABLED) {
+      const balanceCol = await getPaperBalanceCollection();
+      let currentBalance = config.PAPER_TRADING_INITIAL_BALANCE;
+      if (balanceCol) {
+        const balDoc = await balanceCol.findOne({});
+        if (balDoc) {
+          currentBalance = balDoc.balance;
+        } else {
+          await balanceCol.insertOne({ balance: currentBalance, updatedAt: new Date() });
+        }
+      }
+
+      const balanceStr = currentBalance.toFixed(2);
+      return res.json({
+        address: "PAPER_WALLET",
+        walletAddress: "PAPER_WALLET",
+        funderAddress: null,
+        tradingAddress: "PAPER_WALLET",
+        balance: balanceStr,
+        polymarketBalance: balanceStr,
+        polymarketRawBalance: "0",
+        onChainBalance: balanceStr,
+        tokenAddressUsed: "PAPER",
+        tokenSymbolUsed: "PAPER_USDC"
+      });
+    }
+
     const client = await getClobClient();
     const wallet = getClobWallet();
     if (!wallet) return res.status(400).json({ error: "Wallet not initialized." });
@@ -255,6 +283,64 @@ router.get("/api/polymarket/balance", async (req, res) => {
 // Performance
 router.get("/api/polymarket/performance", async (req, res) => {
   try {
+    if (config.PAPER_TRADING_ENABLED) {
+      const positionsCol = await getPaperPositionsCollection();
+      if (!positionsCol) return res.status(500).json({ error: "Paper positions database not configured" });
+
+      const openPositionsDocs = await positionsCol.find({ status: "OPEN" }).toArray();
+      const closedPositionsDocs = await positionsCol.find({ status: "CLOSED" }).sort({ closedAt: -1 }).limit(50).toArray();
+
+      const winCount = closedPositionsDocs.filter(p => p.realizedPnl > 0).length;
+      const lossCount = closedPositionsDocs.filter(p => p.realizedPnl < 0).length;
+      const closedTrades = closedPositionsDocs.length;
+      const winRate = closedTrades > 0 ? (winCount / closedTrades) * 100 : 0;
+      const realizedPnl = closedPositionsDocs.reduce((sum, p) => sum + p.realizedPnl, 0);
+      const openExposure = openPositionsDocs.reduce((sum, p) => sum + p.costBasis, 0);
+
+      const openPositions = openPositionsDocs.map(p => ({
+        assetId: p.assetId,
+        market: p.market,
+        outcome: p.outcome,
+        size: p.size.toFixed(4),
+        costBasis: p.costBasis.toFixed(4),
+        averagePrice: p.averagePrice.toFixed(4),
+        currentValue: p.costBasis.toFixed(4), // Default to cost basis for paper before close
+        cashPnl: "0.00",
+        percentPnl: "0.00",
+        curPrice: p.averagePrice.toFixed(4),
+        redeemable: false
+      }));
+
+      const closedPositions = closedPositionsDocs.map(p => ({
+        assetId: p.assetId,
+        market: p.market,
+        outcome: p.outcome,
+        avgPrice: p.averagePrice.toFixed(4),
+        totalBought: p.costBasis.toFixed(4),
+        realizedPnl: p.realizedPnl.toFixed(4),
+        curPrice: "1.00", // Closed positions result
+        timestamp: p.closedAt ? Math.floor(new Date(p.closedAt).getTime() / 1000) : Math.floor(Date.now() / 1000),
+        endDate: p.closedAt ? new Date(p.closedAt).toISOString() : new Date().toISOString(),
+        eventSlug: p.eventSlug || "paper-event"
+      }));
+
+      return res.json({
+        summary: {
+          totalMatchedTrades: closedTrades,
+          closedTrades,
+          winCount,
+          lossCount,
+          winRate: winRate.toFixed(2),
+          realizedPnl: realizedPnl.toFixed(4),
+          openExposure: openExposure.toFixed(4)
+        },
+        openPositions,
+        closedPositions,
+        history: [],
+        user: "PAPER_WALLET"
+      });
+    }
+
     const userAddress = await getTradingAddress();
     if (!userAddress) return res.status(400).json({ error: "Wallet not initialized." });
 
