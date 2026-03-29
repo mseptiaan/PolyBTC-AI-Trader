@@ -71,54 +71,67 @@ export default function BotLogSidebar() {
   const [learning, setLearning] = useState<LearningState | null>(null);
   const [unread, setUnread] = useState(0);
   const [connected, setConnected] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const topRef = useRef<HTMLDivElement>(null);
   const prevLogLen = useRef(0);
   const prevRawLen = useRef(0);
 
-  const fetchLog = useCallback(async () => {
+  const fetchMeta = useCallback(async () => {
     try {
-      const [logRes, statusRes, rawRes, learnRes] = await Promise.all([
+      const [logRes, statusRes, learnRes] = await Promise.all([
         fetch("/api/bot/log"),
         fetch("/api/bot/status"),
-        fetch("/api/bot/rawlog"),
         fetch("/api/bot/learning"),
       ]);
-      const logData    = await logRes.json();
+      const entries: BotLogEntry[] = (await logRes.json()).log || [];
       const statusData = await statusRes.json();
-      const rawData    = await rawRes.json();
       const learnData  = await learnRes.json();
-      const entries: BotLogEntry[] = logData.log || [];
-      const rawEntries: RawLogEntry[] = rawData.log || [];
+
+      const newTrades = entries.length > prevLogLen.current ? entries.length - prevLogLen.current : 0;
+      if (!open && newTrades > 0) setUnread((u) => u + newTrades);
+      prevLogLen.current = entries.length;
 
       setLog(entries);
-      setRawLog(rawEntries);
       setStatus(statusData);
       setLearning(learnData);
       setConnected(true);
-
-      // Count new entries for unread badge (whichever tab is NOT active)
-      const newTrades = entries.length > prevLogLen.current ? entries.length - prevLogLen.current : 0;
-      const newRaw = rawEntries.length > prevRawLen.current ? rawEntries.length - prevRawLen.current : 0;
-      if (!open) {
-        if (newTrades > 0 || newRaw > 0) setUnread((u) => u + Math.max(newTrades, 1));
-      }
-      prevLogLen.current = entries.length;
-      prevRawLen.current = rawEntries.length;
     } catch {
       setConnected(false);
     }
   }, [open]);
 
   useEffect(() => {
-    fetchLog();
-    const interval = setInterval(fetchLog, 3000);
-    return () => clearInterval(interval);
-  }, [fetchLog]);
+    fetchMeta(); // initial load for trades / status / learning
 
-  // Auto-scroll to bottom when new entries arrive and sidebar is open
+    const es = new EventSource("/api/bot/events");
+
+    es.addEventListener("snapshot", (e: MessageEvent) => {
+      const data = JSON.parse(e.data);
+      const entries: RawLogEntry[] = data.log || [];
+      setRawLog(entries);
+      prevRawLen.current = entries.length;
+      setConnected(true);
+    });
+
+    es.addEventListener("log", (e: MessageEvent) => {
+      const entry: RawLogEntry = JSON.parse(e.data);
+      setRawLog((prev) => [entry, ...prev].slice(0, 500));
+      if (!open) setUnread((u) => u + 1);
+      prevRawLen.current += 1;
+    });
+
+    es.addEventListener("cycle", () => {
+      fetchMeta();
+    });
+
+    es.onerror = () => setConnected(false);
+
+    return () => es.close();
+  }, [fetchMeta, open]);
+
+  // Auto-scroll to top when new entries arrive (newest is at top)
   useEffect(() => {
     if (open) {
-      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
+      setTimeout(() => topRef.current?.scrollIntoView({ behavior: "smooth" }), 50);
     }
   }, [log.length, rawLog.length, open]);
 
@@ -326,11 +339,13 @@ export default function BotLogSidebar() {
                         <p className="text-xs">No activity yet.</p>
                       </div>
                     ) : (
-                      [...rawLog].reverse().map((entry, i) => (
-                        <RawLogLine key={i} entry={entry} />
-                      ))
+                      <>
+                        <div ref={topRef} />
+                        {[...rawLog].map((entry, i) => (
+                          <RawLogLine key={i} entry={entry} />
+                        ))}
+                      </>
                     )}
-                    <div ref={bottomRef} />
                   </div>
                 ) : (
                   <div className="px-3 py-3 space-y-2">
@@ -341,11 +356,13 @@ export default function BotLogSidebar() {
                         <p className="text-xs text-center">Start the bot to see decisions here.</p>
                       </div>
                     ) : (
-                      [...log].reverse().map((entry, i) => (
-                        <BotMessage key={`${entry.timestamp}-${i}`} entry={entry} />
-                      ))
+                      <>
+                        <div ref={topRef} />
+                        {[...log].map((entry, i) => (
+                          <BotMessage key={`${entry.timestamp}-${i}`} entry={entry} />
+                        ))}
+                      </>
                     )}
-                    <div ref={bottomRef} />
                   </div>
                 )}
               </div>

@@ -4,6 +4,7 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import type { ServerResponse } from "http";
 import axios from "axios";
 import { AssetType, ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { ethers } from "ethers";
@@ -65,6 +66,7 @@ function loadTradeLog(): TradeLogEntry[] {
 
 interface PersistedLearning {
   lossMemory: LossMemory[];
+  winMemory: WinMemory[];
   consecutiveLosses: number;
   consecutiveWins: number;
   adaptiveConfidenceBoost: number;
@@ -75,6 +77,7 @@ function saveLearning(): void {
   try {
     const payload: PersistedLearning = {
       lossMemory,
+      winMemory,
       consecutiveLosses,
       consecutiveWins,
       adaptiveConfidenceBoost,
@@ -92,10 +95,11 @@ function loadLearning(): void {
     const raw = fs.readFileSync(LOSS_MEMORY_FILE, "utf8");
     const data: PersistedLearning = JSON.parse(raw);
     lossMemory.push(...(data.lossMemory || []));
+    winMemory.push(...(data.winMemory || []));
     consecutiveLosses       = data.consecutiveLosses       ?? 0;
     consecutiveWins         = data.consecutiveWins         ?? 0;
     adaptiveConfidenceBoost = data.adaptiveConfidenceBoost ?? 0;
-    console.log(`[Persist] Loaded learning state: ${lossMemory.length} loss patterns, streak=${consecutiveLosses}L/${consecutiveWins}W, boost=+${adaptiveConfidenceBoost}%`);
+    console.log(`[Persist] Loaded learning state: ${lossMemory.length} loss / ${winMemory.length} win patterns, streak=${consecutiveLosses}L/${consecutiveWins}W, boost=+${adaptiveConfidenceBoost}%`);
   } catch (e: any) {
     console.error("[Persist] Failed to load loss_memory.json:", e.message);
   }
@@ -303,6 +307,16 @@ interface RawLogEntry {
 }
 const rawLog: RawLogEntry[] = [];
 
+// ── SSE clients for real-time push ────────────────────────────────────────────
+const sseClients = new Set<ServerResponse>();
+function pushSSE(event: string, data: unknown): void {
+  if (sseClients.size === 0) return;
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const client of sseClients) {
+    try { client.write(payload); } catch { sseClients.delete(client); }
+  }
+}
+
 interface PendingResult {
   eventSlug: string;
   marketId: string;
@@ -345,6 +359,25 @@ interface LossMemory {
   lesson: string;
 }
 const lossMemory: LossMemory[] = [];
+
+interface WinMemory {
+  timestamp: string;
+  market: string;
+  direction: string;
+  confidence: number;
+  edge: number;
+  entryPrice: number;
+  betAmount: number;
+  pnl: number;
+  windowElapsedSeconds: number;
+  rsi?: number;
+  emaCross?: string;
+  signalScore?: number;
+  imbalanceSignal?: string;
+  lesson: string;
+}
+const winMemory: WinMemory[] = [];
+
 let consecutiveLosses = 0;
 let consecutiveWins   = 0;
 let adaptiveConfidenceBoost = 0; // added on top of BOT_MIN_CONFIDENCE
@@ -363,6 +396,22 @@ function generateLesson(pending: PendingResult): string {
   if (confidence < 60)             rules.push(`Low confidence entry (${confidence}%) — insufficient conviction`);
 
   return rules.length > 0 ? rules.join(" | ") : "No dominant pattern — low probability setup";
+}
+
+function generateWinLesson(pending: PendingResult): string {
+  const reasons: string[] = [];
+  const { direction, rsi, emaCross, signalScore, windowElapsedSeconds, confidence } = pending;
+
+  if (direction === "UP"   && rsi !== undefined && rsi < 45) reasons.push(`RSI oversold (${rsi.toFixed(0)}) on UP — momentum room available`);
+  if (direction === "DOWN" && rsi !== undefined && rsi > 55) reasons.push(`RSI overbought (${rsi.toFixed(0)}) on DOWN — reversal confirmed`);
+  if (direction === "UP"   && emaCross === "BULLISH")         reasons.push("EMA cross BULLISH aligned with UP direction");
+  if (direction === "DOWN" && emaCross === "BEARISH")         reasons.push("EMA cross BEARISH aligned with DOWN direction");
+  if (direction === "UP"   && signalScore !== undefined && signalScore > 0) reasons.push(`Strong positive signal score (+${signalScore}) on UP trade`);
+  if (direction === "DOWN" && signalScore !== undefined && signalScore < 0) reasons.push(`Strong negative signal score (${signalScore}) on DOWN trade`);
+  if (windowElapsedSeconds <= 150) reasons.push(`Early entry at ${windowElapsedSeconds}s — maximum time for move to develop`);
+  if (confidence >= 72)            reasons.push(`High confidence entry (${confidence}%) — strong conviction`);
+
+  return reasons.length > 0 ? reasons.join(" | ") : "Aligned signals with good timing";
 }
 
 type CacheDocument<T> = {
@@ -1614,6 +1663,15 @@ async function startServer() {
             trailingStopDistance > 0 ? Math.max(0.01, highestPrice - trailingStopDistance) : 0;
           const takeProfit = Number(automation.takeProfit || "0");
           const stopLoss   = Number(automation.stopLoss   || "0");
+          const entryPrice = Number(automation.averagePrice || "0");
+
+          // ── Near-expiry forced exit ──────────────────────────────────────────
+          // Binary markets collapse fast in the last minute — prices drop 20-30¢
+          // in a single tick as market makers pull bids near resolution.
+          // If ≤60s remain and the position is profitable, lock in the gain now.
+          const secondsToExpiry = automation.windowEnd ? automation.windowEnd - nowSeconds : 9999;
+          const isNearExpiry = secondsToExpiry > 0 && secondsToExpiry <= 60;
+          const isCriticalExpiry = secondsToExpiry > 0 && secondsToExpiry <= 30;
 
           // Determine if a trigger condition is met (uses currentPrice for detection)
           let triggerReason: string | null = null;
@@ -1621,13 +1679,19 @@ async function startServer() {
           if (!triggerReason && stopLoss > 0 && currentPrice <= stopLoss) triggerReason = "stop loss";
           if (!triggerReason && trailingStopPrice > 0 && currentPrice <= trailingStopPrice) triggerReason = "trailing stop";
 
+          // Near-expiry: exit any profitable position (prevents late-window reversal)
+          if (!triggerReason && isNearExpiry && entryPrice > 0 && currentPrice > entryPrice * 1.005) {
+            triggerReason = `near-expiry exit (${secondsToExpiry}s remaining — locking ${(((currentPrice / entryPrice) - 1) * 100).toFixed(1)}% gain)`;
+          }
+
           if (triggerReason) {
             // TP: only execute if there's a real bid (need an actual buyer)
-            // SL/trailing: execute AGGRESSIVE even at thin bid to limit losses
+            // SL/trailing/near-expiry: execute AGGRESSIVE even on thin bid
             const isTakeProfit = triggerReason === "take profit";
             const executionPrice = bestBid > 0 ? bestBid : (bestAsk > 0 ? bestAsk * 0.90 : null);
 
-            if (isTakeProfit && !(bestBid > 0)) {
+            // In critical expiry zone (≤30s), skip the wait-for-bid guard entirely
+            if (isTakeProfit && !(bestBid > 0) && !isCriticalExpiry) {
               // TP hit on price estimate but no buyer yet — wait for a real bid
               await savePositionAutomation({
                 assetId: automation.assetId,
@@ -1669,12 +1733,15 @@ async function startServer() {
           }
 
           // No trigger — update tracking state and keep armed
+          const expiryLabel = secondsToExpiry < 9999
+            ? ` | Expiry: ${secondsToExpiry}s`
+            : "";
           await savePositionAutomation({
             assetId: automation.assetId,
             highestPrice: highestPrice.toFixed(4),
             trailingStopPrice: trailingStopPrice > 0 ? trailingStopPrice.toFixed(4) : "",
             lastPrice: currentPrice.toFixed(4),
-            status: `Monitoring — ${(currentPrice * 100).toFixed(0)}¢ | TP: ${(takeProfit * 100).toFixed(0)}¢ | SL: ${(stopLoss * 100).toFixed(0)}¢`,
+            status: `Monitoring — ${(currentPrice * 100).toFixed(0)}¢ | TP: ${(takeProfit * 100).toFixed(0)}¢ | SL: ${(stopLoss * 100).toFixed(0)}¢${expiryLabel}`,
           });
         } catch (error: any) {
           await savePositionAutomation({
@@ -1709,9 +1776,11 @@ async function startServer() {
       SKIP:  "✗",
       ERR:   "✖",
     };
-    console.log(`[${ts()}] [BOT:${level.padEnd(5)}] ${icons[level]} ${msg}`);
-    rawLog.unshift({ ts: ts(), level, msg });
+    const entry: RawLogEntry = { ts: ts(), level, msg };
+    console.log(`[${entry.ts}] [BOT:${level.padEnd(5)}] ${icons[level]} ${msg}`);
+    rawLog.unshift(entry);
     if (rawLog.length > 500) rawLog.pop();
+    pushSSE("log", entry);
   };
 
   // ── Pre-fetch next window data while current window is closing ───────────
@@ -1820,7 +1889,9 @@ async function startServer() {
         orderBooks,
         marketHistory,
         15,
-        lossMemory.slice(0, 5)
+        lossMemory.slice(0, 5),
+        undefined,
+        winMemory.slice(0, 3)
       );
 
       const icon = rec.decision === "TRADE" ? (rec.direction === "UP" ? "▲" : "▼") : "—";
@@ -1975,6 +2046,25 @@ async function startServer() {
           botPrint("OK", `Adaptive learning: streak=${consecutiveWins}W — threshold relaxed to ${BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost}% (boost=${adaptiveConfidenceBoost > 0 ? `+${adaptiveConfidenceBoost}%` : "none"})`);
         }
         botPrint("OK", `━━━ 🏆 WIN  ━━━ ${pending.market.slice(0, 45)} | ${pending.direction} | Entry: ${(pending.entryPrice * 100).toFixed(1)}¢ | Bet: $${pending.betAmount.toFixed(2)} | PnL: ${pnlStr}`);
+        const winLesson = generateWinLesson(pending);
+        winMemory.unshift({
+          timestamp: new Date().toISOString(),
+          market: pending.market,
+          direction: pending.direction,
+          confidence: pending.confidence,
+          edge: pending.edge,
+          entryPrice: pending.entryPrice,
+          betAmount: pending.betAmount,
+          pnl,
+          windowElapsedSeconds: pending.windowElapsedSeconds,
+          rsi: pending.rsi,
+          emaCross: pending.emaCross,
+          signalScore: pending.signalScore,
+          imbalanceSignal: pending.imbalanceSignal,
+          lesson: winLesson,
+        });
+        if (winMemory.length > 20) winMemory.pop();
+        botPrint("INFO", `Win pattern recorded: ${winLesson}`);
         saveLearning();
         saveTradeLog({
           ts: new Date().toISOString(),
@@ -2289,7 +2379,8 @@ async function startServer() {
               marketHistory,
               windowElapsedSeconds,
               lossMemory.slice(0, 5),
-              div
+              div,
+              winMemory.slice(0, 3)
             );
           }
 
@@ -2442,7 +2533,29 @@ async function startServer() {
                 const p = rec.confidence / 100;
                 const b = (1 - impliedPrice) / impliedPrice;
                 const kelly = (p * b - (1 - p)) / b;
-                const rawBet = kelly > 0 ? currentBalance * kelly * cfg.kellyFraction : 0;
+
+                // ── Volatility-adjusted Kelly ───────────────────────────────
+                // Scale bet down when BTC is choppy (high ATR = noisy market).
+                // ATR = avg true range of last 10 1-min candles.
+                // Baseline: 0.15% of BTC price (e.g. $120 on $80K BTC).
+                // Above baseline → reduce Kelly. Below → capped at 1.0 (no reward for calm).
+                let volMultiplier = 1.0;
+                const btcCandles = btcHistoryResult?.history ?? [];
+                if (btcCandles.length >= 5 && btcPriceData?.price) {
+                  const last10 = btcCandles.slice(-10);
+                  const atr = last10.reduce((sum: number, c: { high: number; low: number }) => sum + (c.high - c.low), 0) / last10.length;
+                  const btcPriceNum = Number(btcPriceData.price);
+                  if (btcPriceNum > 0) {
+                    const normalizedAtr = atr / btcPriceNum; // as fraction of price
+                    const BASELINE_ATR = 0.0015;            // 0.15% = calm/normal BTC
+                    volMultiplier = Math.max(0.50, Math.min(1.0, BASELINE_ATR / normalizedAtr));
+                    if (volMultiplier < 1.0) {
+                      botPrint("INFO", `Volatility gate: ATR=${atr.toFixed(0)} (${(normalizedAtr * 100).toFixed(2)}% of price) → Kelly scaled to ${(volMultiplier * 100).toFixed(0)}%`);
+                    }
+                  }
+                }
+
+                const rawBet = kelly > 0 ? currentBalance * kelly * cfg.kellyFraction * volMultiplier : 0;
 
                 // Cap to Kelly formula, max bet config, and balance cap (mode-dependent)
                 const kellyCapped = Math.min(rawBet, cfg.maxBetUsdc, currentBalance * cfg.balanceCap);
@@ -2539,6 +2652,7 @@ async function startServer() {
 
           botLog.unshift(logEntry);
           if (botLog.length > 100) botLog.pop();
+          pushSSE("cycle", { ts: new Date().toISOString() });
         } catch (err: any) {
           botPrint("ERR", `Analysis error: ${err?.message || String(err)}`);
         }
@@ -2629,6 +2743,20 @@ async function startServer() {
     res.json({ log: rawLog });
   });
 
+  // ── SSE endpoint — real-time bot events ────────────────────────────────────
+  app.get("/api/bot/events", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
+
+    // Send current log snapshot so the client is immediately up-to-date
+    res.write(`event: snapshot\ndata: ${JSON.stringify({ log: rawLog.slice(0, 200) })}\n\n`);
+
+    sseClients.add(res as unknown as ServerResponse);
+    req.on("close", () => sseClients.delete(res as unknown as ServerResponse));
+  });
+
   app.get("/api/bot/learning", (_req, res) => {
     res.json({
       consecutiveLosses,
@@ -2637,7 +2765,9 @@ async function startServer() {
       effectiveMinConfidence: BOT_MIN_CONFIDENCE + adaptiveConfidenceBoost,
       baseMinConfidence: BOT_MIN_CONFIDENCE,
       lossMemoryCount: lossMemory.length,
+      winMemoryCount: winMemory.length,
       recentLosses: lossMemory.slice(0, 10),
+      recentWins: winMemory.slice(0, 10),
     });
   });
 

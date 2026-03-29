@@ -216,6 +216,19 @@ interface LossPattern {
   lesson: string;
 }
 
+interface WinPattern {
+  direction: string;
+  confidence: number;
+  entryPrice: number;
+  pnl: number;
+  windowElapsedSeconds: number;
+  rsi?: number;
+  emaCross?: string;
+  signalScore?: number;
+  imbalanceSignal?: string;
+  lesson: string;
+}
+
 interface DivergenceSignal {
   btcDelta30s: number;
   btcDelta60s: number;
@@ -239,7 +252,8 @@ export async function analyzeMarket(
   marketHistory: { t: number; yes: number; no: number }[] = [],
   windowElapsedSeconds: number = 150,
   lossPatterns: LossPattern[] = [],
-  divergence: DivergenceSignal | null = null
+  divergence: DivergenceSignal | null = null,
+  winPatterns: WinPattern[] = []
 ): Promise<AIRecommendation> {
   const sentimentSummary = sentiment
     ? `${sentiment.value_classification} (${sentiment.value}/100)`
@@ -303,14 +317,14 @@ export async function analyzeMarket(
     const ob = orderBooks[tid];
     return sum + (ob?.totalLiquidityUsdc ?? 0);
   }, 0);
-  if (totalLiquidity > 0 && totalLiquidity < 150) {
+  if (totalLiquidity > 0 && totalLiquidity < 500) {
     return {
       decision: "NO_TRADE",
       direction: "NONE",
       confidence: 0,
       estimatedEdge: 0,
       candlePatterns: patterns,
-      reasoning: `Insufficient order book liquidity: $${totalLiquidity.toFixed(0)} USDC total (minimum $150). Book too thin for any fill.`,
+      reasoning: `Insufficient order book liquidity: $${totalLiquidity.toFixed(0)} USDC total (minimum $500). Book too thin for any fill.`,
       riskLevel: "HIGH",
       dataMode,
       reversalProbability: 50,
@@ -411,6 +425,15 @@ ${lossPatterns.map((l, i) =>
 `
     : "";
 
+  const winPatternBlock = winPatterns.length > 0
+    ? `== ADAPTIVE LEARNING: RECENT WIN PATTERNS (REPLICATE THESE SETUPS) ==
+${winPatterns.map((w, i) =>
+  `[${i + 1}] Dir: ${w.direction} | Entry: ${(w.entryPrice * 100).toFixed(1)}¢ | Conf: ${w.confidence}% | PnL: +$${w.pnl.toFixed(2)} | Window: ${w.windowElapsedSeconds}s | RSI: ${w.rsi?.toFixed(0) ?? "?"} | EMA: ${w.emaCross ?? "?"} | Signal: ${w.signalScore !== undefined ? (w.signalScore > 0 ? `+${w.signalScore}` : w.signalScore) : "?"} | OB: ${w.imbalanceSignal ?? "?"}
+    Why it won: ${w.lesson}`
+).join("\n")}
+`
+    : "";
+
   const prompt = `You are a quantitative trader analyzing a Polymarket BTC 5-minute prediction market.
 Determine if there is a profitable edge to trade, and which direction.
 Current analysis mode: ${dataMode}.
@@ -468,7 +491,7 @@ Interpretation: ${
 }
 
 `;
-})()}${lossPatternBlock}== AGGRESSIVE TRADE RULES (max trade frequency, professional scalper mode) ==
+})()}${lossPatternBlock}${winPatternBlock}== AGGRESSIVE TRADE RULES (max trade frequency, professional scalper mode) ==
 1. MINIMUM ALIGNMENT: Output TRADE if at least 2 of these 4 signals agree on the same direction:
    - 60m bias
    - 5m confirmation
@@ -490,7 +513,8 @@ Interpretation: ${
     - Only set riskLevel = HIGH if reversal probability > 60% AND signals are split 2/2 or worse
 12. WINDOW TIMING: windowElapsedSeconds < 10 = too early (output NO_TRADE). windowElapsedSeconds > 285 = too late (output NO_TRADE). ALL other times (10-285s) are valid entry zones — trade them.
 13. LOSS PATTERN LEARNING: If the ADAPTIVE LEARNING section above contains recent losses, study them. If the current setup matches a loss pattern (same direction + similar RSI/EMA/signal/window conditions), reduce your confidence by 10% and increase riskLevel by one step. Never repeat the exact same setup that already lost — look for a meaningfully different context before trading the same direction again.
-14. PRICE LAG DIVERGENCE (HIGHEST PRIORITY): If the PRICE LAG DIVERGENCE section shows strength=STRONG or MODERATE — this overrides all other signals. The Polymarket price has NOT caught up to the real BTC move yet. Set decision=TRADE in the divergence direction with confidence >= 75% and riskLevel="LOW". This is the best edge available in these markets.
+14. WIN PATTERN REPLICATION: If the ADAPTIVE LEARNING section above contains recent wins, study them. If the current setup closely matches a win pattern (same direction + similar RSI/EMA/signal/window conditions), increase your confidence by 5% and treat the signal as confirmed. A setup that has already won under similar conditions is a higher-probability entry.
+15. PRICE LAG DIVERGENCE (HIGHEST PRIORITY): If the PRICE LAG DIVERGENCE section shows strength=STRONG or MODERATE — this overrides all other signals. The Polymarket price has NOT caught up to the real BTC move yet. Set decision=TRADE in the divergence direction with confidence >= 75% and riskLevel="LOW". This is the best edge available in these markets.
 
 Respond with JSON only:
 {

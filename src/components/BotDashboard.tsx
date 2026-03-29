@@ -135,6 +135,37 @@ interface Automation {
   status?: string;
 }
 
+interface TradeLogEntry {
+  ts: string;
+  market: string;
+  direction: "UP" | "DOWN";
+  confidence: number;
+  edge: number;
+  betAmount: number;
+  entryPrice: number;
+  pnl: number;
+  result: "WIN" | "LOSS";
+  divergenceDirection?: string;
+  divergenceStrength?: string;
+  btcDelta30s?: number;
+  yesDelta30s?: number;
+  windowElapsedSeconds: number;
+}
+
+interface TradeLogStats {
+  total: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  totalPnl: number;
+  divergence: {
+    trades: number;
+    wins: number;
+    winRate: number | null;
+  };
+  entries: TradeLogEntry[];
+}
+
 export default function BotDashboard() {
   const [status, setStatus] = useState<BotStatus | null>(null);
   const [log, setLog] = useState<BotLogEntry[]>([]);
@@ -145,15 +176,17 @@ export default function BotDashboard() {
   const [refreshing, setRefreshing] = useState(false);
   const [resetConfLoading, setResetConfLoading] = useState(false);
   const [modeLoading, setModeLoading] = useState(false);
+  const [tradeLog, setTradeLog] = useState<TradeLogStats | null>(null);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [statusRes, logRes, perfRes, autoRes, balRes] = await Promise.allSettled([
+      const [statusRes, logRes, perfRes, autoRes, balRes, tradeLogRes] = await Promise.allSettled([
         fetch("/api/bot/status").then((r) => r.json()),
         fetch("/api/bot/log").then((r) => r.json()),
         fetch("/api/polymarket/performance").then((r) => r.json()),
         fetch("/api/polymarket/automation").then((r) => r.json()),
         fetch("/api/polymarket/balance").then((r) => r.json()),
+        fetch("/api/bot/trade-log?limit=50").then((r) => r.json()),
       ]);
 
       if (statusRes.status === "fulfilled") setStatus(statusRes.value as BotStatus);
@@ -162,6 +195,7 @@ export default function BotDashboard() {
         setPerformance(perfRes.value as any);
       }
       if (autoRes.status === "fulfilled") setAutomations((autoRes.value as any).automations || []);
+      if (tradeLogRes.status === "fulfilled") setTradeLog(tradeLogRes.value as TradeLogStats);
       if (balRes.status === "fulfilled" && !(balRes.value as any).error) {
         setBalance((balRes.value as any).balance || "—");
       }
@@ -170,8 +204,11 @@ export default function BotDashboard() {
 
   useEffect(() => {
     fetchAll();
-    const interval = setInterval(fetchAll, 5000);
-    return () => clearInterval(interval);
+
+    const es = new EventSource("/api/bot/events");
+    es.addEventListener("cycle", () => fetchAll());
+    // Reconnect silently on error — browser retries EventSource automatically
+    return () => es.close();
   }, [fetchAll]);
 
   const handleToggleMode = async () => {
@@ -858,6 +895,144 @@ export default function BotDashboard() {
           </div>
         </div>
       )}
+
+      {/* ── Divergence Stats ── */}
+      <div className="glass-card p-4">
+        <h3 className="text-sm font-bold uppercase tracking-wider text-zinc-400 mb-4 flex items-center gap-2">
+          <Zap className="w-4 h-4 text-yellow-400" />
+          Divergence (Price Lag) Performance
+          {tradeLog && (
+            <span className="text-xs font-normal text-zinc-600 normal-case tracking-normal ml-1">
+              {tradeLog.total} total trades tracked
+            </span>
+          )}
+        </h3>
+
+        {/* Top stat row */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+          {[
+            {
+              label: "Overall Win Rate",
+              value: tradeLog ? `${tradeLog.winRate}%` : "—",
+              sub: tradeLog ? `${tradeLog.wins}W / ${tradeLog.losses}L` : "no data",
+              color: tradeLog && tradeLog.winRate >= 55 ? "text-green-400" : tradeLog && tradeLog.winRate > 0 ? "text-yellow-400" : "text-zinc-500",
+            },
+            {
+              label: "Divergence Win Rate",
+              value: tradeLog?.divergence.winRate != null ? `${tradeLog.divergence.winRate}%` : "—",
+              sub: tradeLog ? `${tradeLog.divergence.wins}W / ${tradeLog.divergence.trades - tradeLog.divergence.wins}L (${tradeLog.divergence.trades} trades)` : "no data",
+              color: tradeLog?.divergence.winRate != null
+                ? tradeLog.divergence.winRate >= 60 ? "text-green-400" : tradeLog.divergence.winRate >= 50 ? "text-yellow-400" : "text-red-400"
+                : "text-zinc-500",
+            },
+            {
+              label: "Total PnL",
+              value: tradeLog ? `${tradeLog.totalPnl >= 0 ? "+" : ""}$${tradeLog.totalPnl.toFixed(2)}` : "—",
+              sub: "realized",
+              color: tradeLog ? (tradeLog.totalPnl > 0 ? "text-green-400" : tradeLog.totalPnl < 0 ? "text-red-400" : "text-zinc-500") : "text-zinc-500",
+            },
+            {
+              label: "Edge Status",
+              value: tradeLog?.divergence.winRate != null
+                ? tradeLog.divergence.winRate >= 60 ? "ACTIVE" : tradeLog.divergence.winRate >= 50 ? "MARGINAL" : "GONE"
+                : "MEASURING",
+              sub: tradeLog?.divergence.trades ? `${tradeLog.divergence.trades} signals fired` : "need 20+ trades",
+              color: tradeLog?.divergence.winRate != null
+                ? tradeLog.divergence.winRate >= 60 ? "text-green-400" : tradeLog.divergence.winRate >= 50 ? "text-yellow-400" : "text-red-400"
+                : "text-zinc-500",
+            },
+          ].map(({ label, value, sub, color }) => (
+            <div key={label} className="bg-zinc-800/50 rounded-lg p-3 border border-zinc-700/50">
+              <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">{label}</div>
+              <div className={cn("text-xl font-mono font-bold", color)}>{value}</div>
+              <div className="text-[10px] text-zinc-600 mt-0.5">{sub}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Divergence signal threshold guide */}
+        <div className="flex items-center gap-3 mb-4 text-[10px]">
+          <span className="text-zinc-600">Signal threshold:</span>
+          {[
+            { label: "STRONG", desc: "BTC $100+ in 30s", color: "bg-yellow-500/20 text-yellow-300 border-yellow-500/40" },
+            { label: "MODERATE", desc: "BTC $60+ in 30s", color: "bg-orange-500/20 text-orange-300 border-orange-500/40" },
+            { label: "WEAK", desc: "BTC $30+ in 30s", color: "bg-zinc-700 text-zinc-400 border-zinc-600" },
+          ].map(({ label, desc, color }) => (
+            <span key={label} className={cn("px-2 py-0.5 rounded-full border font-bold flex items-center gap-1", color)}>
+              {label} <span className="font-normal opacity-70">{desc}</span>
+            </span>
+          ))}
+        </div>
+
+        {/* Recent divergence trades */}
+        {tradeLog && tradeLog.entries.filter((e) => e.divergenceStrength === "STRONG" || e.divergenceStrength === "MODERATE").length > 0 ? (
+          <>
+            <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-2">Recent Divergence Trades</div>
+            <div className="overflow-y-auto max-h-48">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-left text-[10px] uppercase tracking-widest text-zinc-600 border-b border-zinc-800">
+                    <th className="pb-1.5 pr-3">Time</th>
+                    <th className="pb-1.5 pr-3">Dir</th>
+                    <th className="pb-1.5 pr-3">Strength</th>
+                    <th className="pb-1.5 pr-3">BTC Δ30s</th>
+                    <th className="pb-1.5 pr-3">YES Δ30s</th>
+                    <th className="pb-1.5 pr-3">Conf</th>
+                    <th className="pb-1.5 pr-3">Bet</th>
+                    <th className="pb-1.5">PnL</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tradeLog.entries
+                    .filter((e) => e.divergenceStrength === "STRONG" || e.divergenceStrength === "MODERATE")
+                    .map((e, i) => (
+                      <tr key={i} className="border-b border-zinc-800/40 hover:bg-zinc-800/30 transition-colors">
+                        <td className="py-1.5 pr-3 font-mono text-zinc-500 text-[10px]">
+                          {new Date(e.ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false })}
+                        </td>
+                        <td className="py-1.5 pr-3">
+                          <span className={cn("font-bold", e.direction === "UP" ? "text-green-400" : "text-red-400")}>
+                            {e.direction === "UP" ? "▲" : "▼"} {e.direction}
+                          </span>
+                        </td>
+                        <td className="py-1.5 pr-3">
+                          <span className={cn(
+                            "px-1.5 py-0.5 rounded-full text-[9px] font-bold border",
+                            e.divergenceStrength === "STRONG"
+                              ? "bg-yellow-500/20 text-yellow-300 border-yellow-500/40"
+                              : "bg-orange-500/20 text-orange-300 border-orange-500/40"
+                          )}>
+                            {e.divergenceStrength}
+                          </span>
+                        </td>
+                        <td className="py-1.5 pr-3 font-mono text-zinc-300">
+                          {e.btcDelta30s != null ? `${e.btcDelta30s >= 0 ? "+" : ""}$${e.btcDelta30s.toFixed(0)}` : "—"}
+                        </td>
+                        <td className="py-1.5 pr-3 font-mono text-zinc-300">
+                          {e.yesDelta30s != null ? `${e.yesDelta30s >= 0 ? "+" : ""}${e.yesDelta30s.toFixed(2)}¢` : "—"}
+                        </td>
+                        <td className="py-1.5 pr-3 font-mono text-zinc-400">{e.confidence}%</td>
+                        <td className="py-1.5 pr-3 font-mono text-zinc-400">${e.betAmount.toFixed(2)}</td>
+                        <td className="py-1.5 font-mono font-bold">
+                          <span className={e.result === "WIN" ? "text-green-400" : "text-red-400"}>
+                            {e.pnl >= 0 ? "+" : ""}${e.pnl.toFixed(2)}
+                            <span className="ml-1 text-[9px] opacity-70">{e.result}</span>
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : (
+          <div className="text-center py-6 text-zinc-600 text-xs">
+            {tradeLog
+              ? "No divergence trades yet — bot will log STRONG/MODERATE signals automatically"
+              : "Loading trade history…"}
+          </div>
+        )}
+      </div>
 
       {/* ── Bot Decision Log ── */}
       <div className="glass-card p-4">
