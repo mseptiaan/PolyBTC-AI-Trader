@@ -1,5 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
-import { Market, AIRecommendation, BTCHistory, SentimentData, OrderBook, BTCIndicators } from "../types";
+import { Market, AIRecommendation, BTCHistory, SentimentData, OrderBook, BTCIndicators } from "../types/index";
 import {
   LossPattern,
   WinPattern,
