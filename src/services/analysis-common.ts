@@ -1,0 +1,624 @@
+import { Market, AIRecommendation, BTCHistory, SentimentData, OrderBook, BTCIndicators } from "../types";
+
+export interface Candle {
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface LossPattern {
+  direction: string;
+  confidence: number;
+  entryPrice: number;
+  windowElapsedSeconds: number;
+  rsi?: number;
+  emaCross?: string;
+  signalScore?: number;
+  imbalanceSignal?: string;
+  lesson: string;
+}
+
+export interface WinPattern {
+  direction: string;
+  confidence: number;
+  entryPrice: number;
+  pnl: number;
+  windowElapsedSeconds: number;
+  rsi?: number;
+  emaCross?: string;
+  signalScore?: number;
+  imbalanceSignal?: string;
+  lesson: string;
+}
+
+export interface DivergenceSignal {
+  btcDelta30s: number;
+  btcDelta60s: number;
+  yesDelta30s: number;
+  divergence: number;
+  direction: "UP" | "DOWN" | "NEUTRAL";
+  strength: "STRONG" | "MODERATE" | "WEAK" | "NONE";
+  currentBtcPrice: number | null;
+  currentYesAsk: number | null;
+  currentNoAsk: number | null;
+  updatedAt: number;
+}
+
+export type Direction = "UP" | "DOWN" | "MIXED";
+
+export interface TriggerAnalysis {
+  trigger: Direction;
+  patterns: string[];
+  summary: string;
+}
+
+export interface ConfirmationAnalysis {
+  confirmation: Direction;
+  summary: string;
+}
+
+export interface BiasAnalysis {
+  bias: Direction;
+  summary: string;
+}
+
+export interface AlignmentResult {
+  bullish: number;
+  bearish: number;
+  aligned: Direction;
+}
+
+export function aggregateCandles(history: BTCHistory[], bucketSize: number): Candle[] {
+  if (!history.length || bucketSize <= 1) return history;
+
+  const aggregated: Candle[] = [];
+  for (let i = 0; i < history.length; i += bucketSize) {
+    const bucket = history.slice(i, i + bucketSize);
+    if (!bucket.length) continue;
+    aggregated.push({
+      open: bucket[0].open,
+      high: Math.max(...bucket.map((c) => c.high)),
+      low: Math.min(...bucket.map((c) => c.low)),
+      close: bucket[bucket.length - 1].close,
+      volume: bucket.reduce((sum, c) => sum + c.volume, 0),
+    });
+  }
+
+  return aggregated;
+}
+
+export function computeDirectionalBias(candles: Candle[]): Direction {
+  if (candles.length < 3) return "MIXED";
+  const first = candles[0].close;
+  const last = candles[candles.length - 1].close;
+  const risingCloses = candles.slice(-3).every((c, i, arr) => i === 0 || c.close >= arr[i - 1].close);
+  const fallingCloses = candles.slice(-3).every((c, i, arr) => i === 0 || c.close <= arr[i - 1].close);
+
+  if (last > first && risingCloses) return "UP";
+  if (last < first && fallingCloses) return "DOWN";
+  return "MIXED";
+}
+
+export function computeMultiTimeframeAlignment(
+  bias: Direction,
+  confirmation: Direction,
+  trigger: Direction,
+  indicators: BTCIndicators | null
+): AlignmentResult {
+  let bullish = 0;
+  let bearish = 0;
+
+  if (bias === "UP") bullish++;
+  else if (bias === "DOWN") bearish++;
+
+  if (confirmation === "UP") bullish++;
+  else if (confirmation === "DOWN") bearish++;
+
+  if (trigger === "UP") bullish++;
+  else if (trigger === "DOWN") bearish++;
+
+  if (indicators) {
+    if (indicators.signalScore >= 2) bullish++;
+    else if (indicators.signalScore <= -2) bearish++;
+  }
+
+  const aligned = bullish >= 2 ? "UP" : bearish >= 2 ? "DOWN" : "MIXED";
+
+  return { bullish, bearish, aligned };
+}
+
+export function describeSixtyMinuteBias(history: BTCHistory[], indicators: BTCIndicators | null): BiasAnalysis {
+  if (history.length < 20) {
+    return {
+      bias: "MIXED",
+      summary: "60m bias unavailable.",
+    };
+  }
+
+  const first = history[0].close;
+  const last = history[history.length - 1].close;
+  const movePct = first > 0 ? ((last - first) / first) * 100 : 0;
+  const rangeHigh = Math.max(...history.map((c) => c.high));
+  const rangeLow = Math.min(...history.map((c) => c.low));
+  const bias =
+    indicators?.emaCross === "BULLISH" && movePct > 0.15
+      ? "UP"
+      : indicators?.emaCross === "BEARISH" && movePct < -0.15
+        ? "DOWN"
+        : Math.abs(movePct) < 0.1
+          ? "MIXED"
+          : movePct > 0
+            ? "UP"
+            : "DOWN";
+
+  return {
+    bias,
+    summary: `60m bias: ${bias}. Move ${movePct.toFixed(2)}%. Range ${rangeLow.toFixed(1)} -> ${rangeHigh.toFixed(1)}. EMA cross ${indicators?.emaCross ?? "UNKNOWN"}. RSI ${indicators?.rsi ?? "?"}.`,
+  };
+}
+
+export function describeFiveMinuteConfirmation(history: BTCHistory[]): ConfirmationAnalysis {
+  const candles5m = aggregateCandles(history.slice(-30), 5);
+  if (candles5m.length < 3) {
+    return {
+      confirmation: "MIXED",
+      summary: "5m confirmation unavailable.",
+    };
+  }
+
+  const recent = candles5m.slice(-4);
+  const direction = computeDirectionalBias(recent);
+  const last = recent[recent.length - 1];
+  const previous = recent[recent.length - 2];
+  const breakout = last.close > previous.high ? "bullish breakout" : last.close < previous.low ? "bearish breakdown" : "inside range";
+
+  return {
+    confirmation: direction,
+    summary: `5m confirmation: ${direction}. Last 5m candle O:${last.open.toFixed(1)} H:${last.high.toFixed(1)} L:${last.low.toFixed(1)} C:${last.close.toFixed(1)} with ${breakout}.`,
+  };
+}
+
+export function describeOneMinuteTrigger(history: BTCHistory[]): TriggerAnalysis {
+  const last5 = history.slice(-5);
+  if (last5.length < 3) {
+    return {
+      trigger: "MIXED",
+      patterns: ["BTC candlestick feed unavailable"],
+      summary: "1m trigger unavailable.",
+    };
+  }
+
+  const patterns = detectPatterns(last5);
+  const direction = computeDirectionalBias(last5);
+  const last = last5[last5.length - 1];
+  const trigger =
+    patterns.some((p) => /Bullish|Hammer|Pin Bar|White Soldiers/i.test(p)) && last.close >= last.open
+      ? "UP"
+      : patterns.some((p) => /Bearish|Shooting Star|Black Crows/i.test(p)) && last.close <= last.open
+        ? "DOWN"
+        : direction;
+
+  return {
+    trigger,
+    patterns,
+    summary: `1m trigger: ${trigger}. Last candle O:${last.open.toFixed(1)} H:${last.high.toFixed(1)} L:${last.low.toFixed(1)} C:${last.close.toFixed(1)}. Patterns: ${patterns.join(", ")}.`,
+  };
+}
+
+export function detectPatterns(candles: Candle[]): string[] {
+  if (candles.length < 2) return [];
+
+  const patterns: string[] = [];
+  const c = candles[candles.length - 1];
+  const p = candles[candles.length - 2];
+  const body = Math.abs(c.close - c.open);
+  const range = c.high - c.low;
+  const upperWick = c.high - Math.max(c.open, c.close);
+  const lowerWick = Math.min(c.open, c.close) - c.low;
+  const bullish = c.close > c.open;
+
+  if (range > 0 && body / range < 0.1) patterns.push("Doji");
+
+  if (lowerWick > body * 2 && upperWick < body * 0.5 && range > 0) {
+    patterns.push(bullish ? "Hammer (bullish)" : "Hanging Man (bearish)");
+  }
+
+  if (upperWick > body * 2 && lowerWick < body * 0.5 && range > 0) {
+    patterns.push(bullish ? "Inverted Hammer" : "Shooting Star (bearish)");
+  }
+
+  if (!(p.close > p.open) && bullish && c.open < p.close && c.close > p.open) {
+    patterns.push("Bullish Engulfing");
+  }
+
+  if (p.close > p.open && !bullish && c.open > p.close && c.close < p.open) {
+    patterns.push("Bearish Engulfing");
+  }
+
+  if (lowerWick > body * 3) patterns.push("Bullish Pin Bar");
+  if (upperWick > body * 3) patterns.push("Bearish Pin Bar");
+
+  if (upperWick < body * 0.05 && lowerWick < body * 0.05 && body > 0) {
+    patterns.push(bullish ? "Bullish Marubozu" : "Bearish Marubozu");
+  }
+
+  if (c.high < p.high && c.low > p.low) patterns.push("Inside Bar (consolidation)");
+
+  if (c.volume > p.volume * 1.5 && patterns.length > 0) {
+    patterns.push("High Volume Confirmation");
+  }
+
+  if (candles.length >= 3) {
+    const c2 = candles[candles.length - 3];
+    const allBull = c.close > c.open && p.close > p.open && c2.close > c2.open;
+    const allBear = c.close < c.open && p.close < p.open && c2.close < c2.open;
+    if (allBull) patterns.push("Three White Soldiers (strong bullish)");
+    if (allBear) patterns.push("Three Black Crows (strong bearish)");
+  }
+
+  return patterns.length > 0 ? patterns : ["No clear pattern"];
+}
+
+export function applyGates(
+  market: Market,
+  orderBooks: Record<string, OrderBook>,
+  windowElapsedSeconds: number,
+  alignment: AlignmentResult,
+  patterns: string[],
+  hasBtcHistory: boolean,
+  dataMode: "FULL_DATA" | "POLYMARKET_ONLY"
+): AIRecommendation | null {
+  if (windowElapsedSeconds < 10 || windowElapsedSeconds > 285) {
+    return {
+      decision: "NO_TRADE",
+      direction: "NONE",
+      confidence: 0,
+      estimatedEdge: 0,
+      candlePatterns: patterns,
+      reasoning:
+        windowElapsedSeconds < 10
+          ? `Too early: only ${windowElapsedSeconds}s into window. Waiting for minimal price discovery (10s).`
+          : `Too late: ${windowElapsedSeconds}s elapsed, only ${300 - windowElapsedSeconds}s remaining. Entry risk too high.`,
+      riskLevel: "HIGH",
+      dataMode,
+      reversalProbability: 50,
+      oppositePressureProbability: 50,
+      reversalReasoning: "Window timing gate triggered.",
+    };
+  }
+
+  const gateTokenIds = market.clobTokenIds || [];
+  const totalLiquidity = gateTokenIds.reduce((sum, tid) => {
+    const ob = orderBooks[tid];
+    return sum + (ob?.totalLiquidityUsdc ?? 0);
+  }, 0);
+  if (totalLiquidity > 0 && totalLiquidity < 500) {
+    return {
+      decision: "NO_TRADE",
+      direction: "NONE",
+      confidence: 0,
+      estimatedEdge: 0,
+      candlePatterns: patterns,
+      reasoning: `Insufficient order book liquidity: $${totalLiquidity.toFixed(0)} USDC total (minimum $500). Book too thin for any fill.`,
+      riskLevel: "HIGH",
+      dataMode,
+      reversalProbability: 50,
+      oppositePressureProbability: 50,
+      reversalReasoning: "Liquidity gate triggered.",
+    };
+  }
+
+  if (hasBtcHistory && alignment.bullish < 2 && alignment.bearish < 2) {
+    return {
+      decision: "NO_TRADE",
+      direction: "NONE",
+      confidence: 0,
+      estimatedEdge: 0,
+      candlePatterns: patterns,
+      reasoning: `Signal alignment too weak to trade. Bullish: ${alignment.bullish}/4, Bearish: ${alignment.bearish}/4. No directional edge — skipping.`,
+      riskLevel: "HIGH",
+      dataMode,
+      reversalProbability: 50,
+      oppositePressureProbability: 50,
+      reversalReasoning: "Conflicting signals make reversal risk high.",
+    };
+  }
+
+  return null;
+}
+
+export function buildPrompt(
+  market: Market,
+  btcPrice: string | null,
+  history: BTCHistory[],
+  sentiment: SentimentData | null,
+  indicators: BTCIndicators | null,
+  orderBooks: Record<string, OrderBook>,
+  marketHistory: { t: number; yes: number; no: number }[],
+  windowElapsedSeconds: number,
+  lossPatterns: LossPattern[],
+  divergence: DivergenceSignal | null,
+  winPatterns: WinPattern[],
+  triggerAnalysis: TriggerAnalysis,
+  confirmationAnalysis: ConfirmationAnalysis,
+  biasAnalysis: BiasAnalysis,
+  alignment: AlignmentResult,
+  hasBtcPrice: boolean,
+  dataMode: "FULL_DATA" | "POLYMARKET_ONLY"
+): string {
+  const sentimentSummary = sentiment
+    ? `${sentiment.value_classification} (${sentiment.value}/100)`
+    : "Unknown";
+
+  const patterns = triggerAnalysis.patterns;
+
+  const last15 = history.slice(-15);
+  const ohlcvTable =
+    last15
+      .map((h, i) => {
+        const dir = h.close >= h.open ? "UP" : "DOWN";
+        return `  [${i + 1}] ${dir} O:${h.open.toFixed(1)} H:${h.high.toFixed(1)} L:${h.low.toFixed(1)} C:${h.close.toFixed(1)} Vol:${h.volume.toFixed(2)}`;
+      })
+      .join("\n") || "BTC candlestick feed unavailable.";
+
+  const indicatorBlock = indicators
+    ? `
+TECHNICAL INDICATORS (last 60x 1m candles):
+- RSI(14): ${indicators.rsi} ${indicators.rsi > 70 ? "⚠ Overbought" : indicators.rsi < 30 ? "⚠ Oversold" : "Neutral"}
+- EMA9: $${indicators.ema9} | EMA21: $${indicators.ema21} -> ${indicators.emaCross}
+- MACD: ${indicators.macd} | Signal: ${indicators.macdSignal} | Histogram: ${indicators.macdHistogram} -> ${indicators.macdTrend}
+- Bollinger Bands: Upper $${indicators.bbUpper} | Mid $${indicators.bbMiddle} | Lower $${indicators.bbLower} | Position: ${indicators.bbPosition}
+- 5-candle Momentum: ${indicators.momentum5}%
+- Trend (last 3): ${indicators.trend}
+- Volume spike: ${indicators.volumeSpike}x avg ${indicators.volumeSpike > 2 ? "⚠ High" : "Normal"}
+- Pre-computed Signal Score: ${indicators.signalScore > 0 ? "+" : ""}${indicators.signalScore} (positive=bullish, negative=bearish, range -8 to +8)
+- Multi-TF Alignment: ${alignment.aligned} (${alignment.bullish} bullish / ${alignment.bearish} bearish out of 4 signals)
+`
+    : "BTC indicators unavailable.";
+
+  const tokenIds = market.clobTokenIds || [];
+  const obLines = tokenIds
+    .map((tid, i) => {
+      const ob = orderBooks[tid];
+      if (!ob) return `  ${market.outcomes[i]}: No data`;
+      return `  ${market.outcomes[i]}: imbalance=${ob.imbalance ?? "?"} -> ${ob.imbalanceSignal ?? "NEUTRAL"} | bid=${ob.bids[0]?.price ?? "?"} ask=${ob.asks[0]?.price ?? "?"}`;
+    })
+    .join("\n");
+
+  const impliedProbs = market.outcomePrices
+    .map((p, i) => `  ${market.outcomes[i]}: ${(parseFloat(p) * 100).toFixed(1)}c`)
+    .join("\n");
+
+  const marketHistoryBlock =
+    marketHistory.length > 0
+      ? marketHistory
+          .slice(-10)
+          .map((point, i) => `  [${i + 1}] yes=${(point.yes * 100).toFixed(1)}c no=${(point.no * 100).toFixed(1)}c t=${point.t}`)
+          .join("\n")
+      : "Polymarket market history unavailable.";
+
+  let priceVelocity = 0;
+  let priceVelocityLabel = "Insufficient data";
+  if (marketHistory.length >= 2) {
+    const latest = marketHistory[marketHistory.length - 1];
+    const lookback = marketHistory.find((p) => latest.t - p.t >= 180) || marketHistory[0];
+    const elapsedMinutes = (latest.t - lookback.t) / 60;
+    if (elapsedMinutes > 0) {
+      priceVelocity = (latest.yes - lookback.yes) / elapsedMinutes;
+      priceVelocityLabel =
+        priceVelocity > 0.04
+          ? `+${priceVelocity.toFixed(3)}/min ⚡ STRONG UP MOMENTUM`
+          : priceVelocity < -0.04
+            ? `${priceVelocity.toFixed(3)}/min ⚡ STRONG DOWN MOMENTUM`
+            : `${priceVelocity.toFixed(3)}/min (neutral)`;
+    }
+  }
+
+  const windowMinutes = Math.floor(windowElapsedSeconds / 60);
+  const windowSeconds = windowElapsedSeconds % 60;
+  const windowTimeLabel = `${windowMinutes}:${String(windowSeconds).padStart(2, "0")} elapsed of 5:00`;
+
+  const lossPatternBlock = lossPatterns.length > 0
+    ? `== ADAPTIVE LEARNING: RECENT LOSS PATTERNS (AVOID THESE SETUPS) ==
+${lossPatterns.map((l, i) =>
+  `[${i + 1}] Dir: ${l.direction} | Entry: ${(l.entryPrice * 100).toFixed(1)}¢ | Conf: ${l.confidence}% | Window: ${l.windowElapsedSeconds}s | RSI: ${l.rsi?.toFixed(0) ?? "?"} | EMA: ${l.emaCross ?? "?"} | Signal: ${l.signalScore !== undefined ? (l.signalScore > 0 ? `+${l.signalScore}` : l.signalScore) : "?"} | OB: ${l.imbalanceSignal ?? "?"}
+    Lesson: ${l.lesson}`
+).join("\n")}
+`
+    : "";
+
+  const winPatternBlock = winPatterns.length > 0
+    ? `== ADAPTIVE LEARNING: RECENT WIN PATTERNS (REPLICATE THESE SETUPS) ==
+${winPatterns.map((w, i) =>
+  `[${i + 1}] Dir: ${w.direction} | Entry: ${(w.entryPrice * 100).toFixed(1)}¢ | Conf: ${w.confidence}% | PnL: +$${w.pnl.toFixed(2)} | Window: ${w.windowElapsedSeconds}s | RSI: ${w.rsi?.toFixed(0) ?? "?"} | EMA: ${w.emaCross ?? "?"} | Signal: ${w.signalScore !== undefined ? (w.signalScore > 0 ? `+${w.signalScore}` : w.signalScore) : "?"} | OB: ${w.imbalanceSignal ?? "?"}
+    Why it won: ${w.lesson}`
+).join("\n")}
+`
+    : "";
+
+  const divergenceBlock = (() => {
+    if (!divergence || divergence.strength === "NONE") return "";
+    const btcDir = divergence.btcDelta30s >= 0 ? "UP" : "DOWN";
+    const lag = divergence.direction !== "NEUTRAL" && divergence.yesDelta30s * (divergence.direction === "UP" ? 1 : -1) < 2.0;
+    return `== PRICE LAG DIVERGENCE (HIGHEST PRIORITY SIGNAL) ==
+BTC moved: ${divergence.btcDelta30s >= 0 ? "+" : ""}$${divergence.btcDelta30s.toFixed(0)} in last 30s (${btcDir})
+BTC 60s change: ${divergence.btcDelta60s >= 0 ? "+" : ""}$${divergence.btcDelta60s.toFixed(0)}
+YES token moved: ${divergence.yesDelta30s >= 0 ? "+" : ""}${divergence.yesDelta30s.toFixed(2)}¢ in last 30s
+Market lag: ${lag ? `YES — Polymarket has NOT priced in the BTC move yet` : "NO — market already caught up"}
+Divergence direction: ${divergence.direction}
+Divergence strength: ${divergence.strength}
+Interpretation: ${
+  divergence.strength === "STRONG"
+    ? `BTC made a STRONG move ${divergence.direction} but Polymarket is lagging — this is a near-certain mispricing. TRADE ${divergence.direction} immediately.`
+    : divergence.strength === "MODERATE"
+      ? `BTC moved ${divergence.direction} and Polymarket is slow to reprice. High-confidence ${divergence.direction} entry.`
+      : `Mild BTC momentum ${divergence.direction}, Polymarket slightly lagging. Treat as supporting signal.`
+}
+
+`;
+  })();
+
+  const prompt = `You are a quantitative trader analyzing a Polymarket BTC 5-minute prediction market.
+Determine if there is a profitable edge to trade, and which direction.
+Current analysis mode: ${dataMode}.
+
+== MARKET ==
+Question: ${market.question}
+Outcomes and implied probabilities:
+${impliedProbs}
+Volume: $${parseFloat(market.volume || "0").toLocaleString()} | Liquidity: $${parseFloat(market.liquidity || "0").toLocaleString()}
+Window: ${market.startDate} -> ${market.endDate}
+Window Position: ${windowTimeLabel} (windowElapsedSeconds=${windowElapsedSeconds})
+
+== BTC PRICE ==
+Current: ${hasBtcPrice ? `$${btcPrice}` : "Unavailable"}
+
+== MULTI-TIMEFRAME DECISION STACK ==
+${biasAnalysis.summary}
+${confirmationAnalysis.summary}
+${triggerAnalysis.summary}
+
+== BTC CANDLESTICK DATA (last 15x 1m candles, oldest to newest) ==
+${ohlcvTable}
+
+== DETECTED CANDLE PATTERNS ==
+${patterns.join(", ")}
+
+== MARKET SENTIMENT ==
+Fear and Greed: ${sentimentSummary}
+${indicatorBlock}
+
+== ORDER BOOK IMBALANCE ==
+${obLines}
+
+== POLYMARKET PRICE HISTORY (recent) ==
+${marketHistoryBlock}
+YES Price Velocity (per min): ${priceVelocityLabel}
+
+${divergenceBlock}${lossPatternBlock}${winPatternBlock}== AGGRESSIVE TRADE RULES (max trade frequency, professional scalper mode) ==
+1. MINIMUM ALIGNMENT: Output TRADE if at least 2 of these 4 signals agree on the same direction:
+   - 60m bias
+   - 5m confirmation
+   - 1m trigger
+   - Technical signal score (positive = bullish, negative = bearish)
+   Only output NO_TRADE if ALL 4 signals are flat/MIXED with zero directional lean.
+2. MINIMUM CONFIDENCE: Output TRADE with confidence >= 52%. Only NO_TRADE below 52%.
+3. MINIMUM EDGE: Edge exists when your probability estimate differs from implied price by more than 0.05 cents. Always output your honest edge estimate — even 0.1¢ is a valid edge worth trading.
+4. RISK LEVEL: 4/4 signals aligned = "LOW". 2-3/4 signals = "MEDIUM". Flat signals or reversal risk > 60% = "HIGH". Both LOW and MEDIUM setups should be traded.
+5. TRADE OFTEN (confidence 52%+): Any 2+ aligned signals + any order book lean = 52-65%. 3+ aligned = 65-78%. All 4 aligned + volume = 78%+. Push toward TRADE whenever there is any directional bias. Lean toward action.
+6. MACD + EMA CROSS: If either MACD histogram or EMA cross shows direction, treat as a signal. Both conflicting = neutral only.
+7. RSI EXTREMES: RSI < 35 = bullish momentum setup; RSI > 65 = bearish momentum setup. Mild extremes (35-45, 55-65) are opportunities, not blockers.
+8. BOLLINGER BAND CONTEXT: Near lower band = potential long. Near upper band = potential short. Both are valid setups — trade the bounce or the breakout based on alignment.
+9. ORDER BOOK PRESSURE: Any lean in the order book (even slight) adds to signal count. Neutral book is still acceptable if technicals align.
+10. POLYMARKET MOMENTUM: Velocity > +0.02/min = UP confirmation. Velocity < -0.02/min = DOWN confirmation. Even weak momentum is a signal.
+11. Reversal risk:
+    - reversalProbability: estimate honestly but do NOT use it to block trades unless > 60%
+    - oppositePressureProbability: same — only flag HIGH if truly extreme
+    - Only set riskLevel = HIGH if reversal probability > 60% AND signals are split 2/2 or worse
+12. WINDOW TIMING: windowElapsedSeconds < 10 = too early (output NO_TRADE). windowElapsedSeconds > 285 = too late (output NO_TRADE). ALL other times (10-285s) are valid entry zones — trade them.
+13. LOSS PATTERN LEARNING: If the ADAPTIVE LEARNING section above contains recent losses, study them. If the current setup matches a loss pattern (same direction + similar RSI/EMA/signal/window conditions), reduce your confidence by 10% and increase riskLevel by one step. Never repeat the exact same setup that already lost — look for a meaningfully different context before trading the same direction again.
+14. WIN PATTERN REPLICATION: If the ADAPTIVE LEARNING section above contains recent wins, study them. If the current setup closely matches a win pattern (same direction + similar RSI/EMA/signal/window conditions), increase your confidence by 5% and treat the signal as confirmed. A setup that has already won under similar conditions is a higher-probability entry.
+15. PRICE LAG DIVERGENCE (HIGHEST PRIORITY): If the PRICE LAG DIVERGENCE section shows strength=STRONG or MODERATE — this overrides all other signals. The Polymarket price has NOT caught up to the real BTC move yet. Set decision=TRADE in the divergence direction with confidence >= 75% and riskLevel="LOW". This is the best edge available in these markets.
+
+Respond with JSON only:
+{
+  "decision": "TRADE" | "NO_TRADE",
+  "direction": "UP" | "DOWN" | "NONE",
+  "confidence": number,
+  "estimatedEdge": number,
+  "candlePatterns": ["pattern1", "pattern2"],
+  "reasoning": "string",
+  "riskLevel": "LOW" | "MEDIUM" | "HIGH",
+  "dataMode": "FULL_DATA" | "POLYMARKET_ONLY",
+  "reversalProbability": number,
+  "oppositePressureProbability": number,
+  "reversalReasoning": "string"
+}`;
+
+  return prompt;
+}
+
+export function parseAIResponse(result: any, patterns: string[], dataMode: "FULL_DATA" | "POLYMARKET_ONLY"): AIRecommendation {
+  return {
+    decision: result.decision || "NO_TRADE",
+    direction: result.direction || "NONE",
+    confidence: result.confidence || 0,
+    estimatedEdge: result.estimatedEdge || 0,
+    candlePatterns: result.candlePatterns || patterns,
+    reasoning: result.reasoning || "Failed to generate analysis.",
+    riskLevel: result.riskLevel || "MEDIUM",
+    dataMode: result.dataMode || dataMode,
+    reversalProbability: result.reversalProbability || 0,
+    oppositePressureProbability: result.oppositePressureProbability || 0,
+    reversalReasoning: result.reversalReasoning || "Reversal layer unavailable.",
+  };
+}
+
+export function createErrorResponse(patterns: string[], dataMode: "FULL_DATA" | "POLYMARKET_ONLY", errorMsg: string): AIRecommendation {
+  return {
+    decision: "NO_TRADE",
+    direction: "NONE",
+    confidence: 0,
+    estimatedEdge: 0,
+    candlePatterns: patterns,
+    reasoning: errorMsg,
+    riskLevel: "HIGH",
+    dataMode,
+    reversalProbability: 0,
+    oppositePressureProbability: 0,
+    reversalReasoning: "Reversal layer unavailable.",
+  };
+}
+
+export interface AnalysisContext {
+  hasBtcPrice: boolean;
+  hasBtcHistory: boolean;
+  dataMode: "FULL_DATA" | "POLYMARKET_ONLY";
+  triggerAnalysis: TriggerAnalysis;
+  confirmationAnalysis: ConfirmationAnalysis;
+  biasAnalysis: BiasAnalysis;
+  alignment: AlignmentResult;
+  patterns: string[];
+}
+
+export function prepareAnalysisContext(
+  btcPrice: string | null,
+  history: BTCHistory[],
+  indicators: BTCIndicators | null
+): AnalysisContext {
+  const hasBtcPrice = Boolean(btcPrice && Number.isFinite(Number(btcPrice)));
+  const hasBtcHistory = history.length >= 5;
+  const dataMode: "FULL_DATA" | "POLYMARKET_ONLY" =
+    hasBtcPrice && hasBtcHistory ? "FULL_DATA" : "POLYMARKET_ONLY";
+
+  const triggerAnalysis = hasBtcHistory
+    ? describeOneMinuteTrigger(history)
+    : { trigger: "MIXED" as const, patterns: ["BTC candlestick feed unavailable"], summary: "1m trigger unavailable." };
+  const confirmationAnalysis = hasBtcHistory
+    ? describeFiveMinuteConfirmation(history)
+    : { confirmation: "MIXED" as const, summary: "5m confirmation unavailable." };
+  const biasAnalysis = hasBtcHistory
+    ? describeSixtyMinuteBias(history, indicators)
+    : { bias: "MIXED" as const, summary: "60m bias unavailable." };
+  const patterns = triggerAnalysis.patterns;
+
+  const alignment = computeMultiTimeframeAlignment(
+    biasAnalysis.bias,
+    confirmationAnalysis.confirmation,
+    triggerAnalysis.trigger,
+    indicators
+  );
+
+  return {
+    hasBtcPrice,
+    hasBtcHistory,
+    dataMode,
+    triggerAnalysis,
+    confirmationAnalysis,
+    biasAnalysis,
+    alignment,
+    patterns,
+  };
+}

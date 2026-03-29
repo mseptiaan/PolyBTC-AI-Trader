@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
 import { Market, AIRecommendation, BTCHistory, SentimentData, OrderBook, BTCIndicators } from "../types";
 import {
   LossPattern,
@@ -11,7 +11,14 @@ import {
   prepareAnalysisContext,
 } from "./analysis-common.js";
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_TOKEN || "";
+const OPENROUTER_BASE_URL = process.env.OPENAI_API_URL || "https://openrouter.ai/api/v1";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "openai/gpt-5.2";
+
+const openai = new OpenAI({
+  baseURL: OPENROUTER_BASE_URL,
+  apiKey: OPENROUTER_API_KEY,
+});
 
 export async function analyzeMarket(
   market: Market,
@@ -60,16 +67,26 @@ export async function analyzeMarket(
   );
 
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-lite-preview",
-      contents: prompt,
-      config: { responseMimeType: "application/json" },
+    const completion = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages: [
+        {
+          role: "system",
+          content: "You are a quantitative trading AI. Always respond with valid JSON matching the requested schema exactly. No explanations outside the JSON."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.3,
     });
 
-    const result = JSON.parse(response.text || "{}");
+    const result = JSON.parse(completion.choices?.[0]?.message?.content || "{}");
     return parseAIResponse(result, ctx.patterns, ctx.dataMode);
   } catch (error) {
-    console.error("AI Analysis Error:", error);
+    console.error("OpenAI Analysis Error:", error);
     return createErrorResponse(ctx.patterns, ctx.dataMode, "Error occurred during AI analysis.");
   }
 }
